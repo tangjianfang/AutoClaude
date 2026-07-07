@@ -5,10 +5,12 @@
 #include <windowsx.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <shellscalingapi.h>
 #include <string>
 #include <memory>
 #include <vector>
 #include <cstdio>
+#include <cmath>
 
 namespace {
 bool DebugOn() {
@@ -37,21 +39,29 @@ void DLog(const wchar_t* fmt, ...) {
 
 namespace {
 
-constexpr int WIN_W_DEFAULT = 480;
-constexpr int WIN_H_DEFAULT = 420;
-constexpr int WIN_W_MIN     = 360;
-constexpr int WIN_H_MIN     = 280;
+constexpr int WIN_W_DEFAULT = 580;
+constexpr int WIN_H_DEFAULT = 520;
+constexpr int WIN_W_MIN     = 420;
+constexpr int WIN_H_MIN     = 360;
+
+constexpr int ROW_H  = 22;
+constexpr int ROW_GAP = 3;
+constexpr int LIST_X = 20;
+constexpr int LIST_Y = 86;
 
 struct Region {
     int x, y, w, h;
     bool Contains(int px, int py) const {
         return px >= x && px < x + w && py >= y && py < y + h;
     }
-    Gdiplus::RectF Rect() const { return Gdiplus::RectF((float)x, (float)y, (float)w, (float)h); }
+    Gdiplus::RectF RectF() const {
+        return Gdiplus::RectF((float)x, (float)y, (float)w, (float)h);
+    }
+    Gdiplus::Rect Rect() const {
+        return Gdiplus::Rect(x, y, w, h);
+    }
 };
 
-// Per-session row in the UI list. Mirrors a TrackInfo from the watcher plus
-// per-row accumulation (last event label, ts, total events parsed).
 struct SessionRow {
     std::wstring path;
     std::wstring projectName;
@@ -59,59 +69,55 @@ struct SessionRow {
     bool isSubagent = false;
     int eventsCount = 0;
     LONGLONG lastEventTsMs = 0;
-    LONGLONG lastAssistantMs = 0;   // ts of last assistant event; used for "Claude is working" indicator
+    LONGLONG lastAssistantMs = 0;
     std::wstring lastEventLabel;
 };
 
-constexpr int ROW_H = 18;
-constexpr int ROW_GAP = 2;
-constexpr int LIST_X = 20;
-constexpr int LIST_Y = 78;
-
-// Layout is recomputed whenever the window resizes. Title/status are pinned
-// to the top, pills/buttons/footer to the bottom; the list area stretches
-// in between. The grip lives in the bottom-right corner as a custom resize
-// handle (WS_POPUP doesn't get a system frame).
 struct Layout {
     Region title;
     Region status;
     Region list;
-    Region pills[4];   // Shutdown / Restart / Hibernate / Lock
+    Region pills[4];
     Region cancelBtn;
     Region startBtn;
     Region closeBtn;
     Region grip;
-    int  listVisibleRows = 7;     // recomputed in Recompute()
+    int  listVisibleRows = 8;
     int  winW = WIN_W_DEFAULT;
     int  winH = WIN_H_DEFAULT;
 
     void Recompute(int w, int h) {
         winW = w; winH = h;
-        title   = {0, 0, w, 36};
-        status  = {20, 44, w - 40, 26};
-        closeBtn = {w - 36, 6, 30, 24};
+        title    = {0, 0, w, 40};
+        status   = {20, 50, w - 40, 28};
+        closeBtn = {w - 40, 6, 32, 28};
 
-        const int pillsH = 48;
-        const int btnH   = 44;
-        const int footerH = 22;
-        const int gapListToPills = 16;
-        const int gapPillsToBtn = 14;
+        const int pillsH = 50;
+        const int btnH   = 52;
+        const int footerH = 26;
+        const int gapListToPills = 18;
+        const int gapPillsToBtn  = 14;
 
-        int bottom = h - footerH;
-        int btnsTop = bottom - btnH;
-        int pillsTop = btnsTop - gapPillsToBtn - pillsH;
+        int bottom    = h - footerH;
+        int btnsTop   = bottom - btnH;
+        int pillsTop  = btnsTop - gapPillsToBtn - pillsH;
         int listBottom = pillsTop - gapListToPills;
-        int listTop = LIST_Y;
-        int listH = std::max(60, listBottom - listTop);
+        int listTop    = LIST_Y;
+        int listH      = std::max(80, listBottom - listTop);
 
         list = {LIST_X, listTop, w - 40, listH};
-        int pw = (w - 40 - 3 * 10) / 4;
+
+        int innerW = w - 40 - 3 * 10;
+        int pw = innerW / 4;
         for (int i = 0; i < 4; ++i)
             pills[i] = {20 + i * (pw + 10), pillsTop, pw, pillsH};
-        cancelBtn = {20, btnsTop, (w - 40) / 2 - 5, btnH};
-        startBtn  = {20 + (w - 40) / 2 + 5, btnsTop, (w - 40) / 2 - 5, btnH};
 
-        grip = {w - 22, h - 22, 22, 22};
+        int halfGap = 8;
+        int halfW   = ((w - 40) - halfGap) / 2;
+        cancelBtn = {20,               btnsTop, halfW, btnH};
+        startBtn  = {20 + halfW + halfGap, btnsTop, halfW, btnH};
+
+        grip = {w - 24, h - 24, 24, 24};
         listVisibleRows = std::max(1, listH / (ROW_H + ROW_GAP));
     }
 
@@ -122,18 +128,25 @@ struct AppCtx {
     Config cfg;
     std::wstring exeDir;
     TranscriptWatcher watcher;
-    StateMachine sm;   // only the primary session drives this SM
+    StateMachine sm;
     bool paused = false;
     Layout layout;
     std::wstring doneMsg;
-    std::wstring dryRunNotice;
 
-    // Active sessions, sorted to match the watcher's order (newest mtime first).
-    // The index of the "primary" session (= index 0) drives the SM; switching
-    // primary resets SM to Monitoring.
     std::vector<SessionRow> sessions;
-    std::wstring primaryPath;       // path of the row that drives the SM
-    int scrollOffset = 0;           // first visible row index
+    std::wstring primaryPath;
+    int scrollOffset = 0;
+
+    // Hover tracking — updated on WM_MOUSEMOVE, cleared on WM_MOUSELEAVE.
+    bool hoverClose = false;
+    bool hoverGrip  = false;
+    bool hoverCancel = false;
+    bool hoverStart = false;
+    int  hoverPill  = -1;     // 0..3, -1 = none
+    bool trackingMouseLeave = false;
+
+    // Animation tick count for the breathing active-dot.
+    ULONGLONG pulseStartMs = 0;
 
     int FindRow(const std::wstring& path) const {
         for (size_t i = 0; i < sessions.size(); ++i)
@@ -144,12 +157,10 @@ struct AppCtx {
     void PrunePrimaryIfGone() {
         if (primaryPath.empty()) return;
         if (FindRow(primaryPath) < 0) {
-            // Primary vanished — fall back to whichever is at index 0 now.
             primaryPath = sessions.empty() ? L"" : sessions[0].path;
-            sm.Cancel();    // back to Monitoring, cancels any pending countdown
+            sm.Cancel();
         }
     }
-
     Action Selected() const { return (Action)cfg.action; }
 };
 
@@ -172,7 +183,6 @@ void SaveCfg(HWND hwnd) {
     if (c) c->cfg.Save(c->exeDir);
 }
 
-// "Now - last" formatted compactly: "5s" / "2m" / "—".
 std::wstring FormatAgo(LONGLONG ms) {
     if (ms <= 0) return L"—";
     if (ms < 1000) return L"now";
@@ -183,94 +193,174 @@ std::wstring FormatAgo(LONGLONG ms) {
     return std::to_wstring((int)(min / 60)) + L"h";
 }
 
-const wchar_t* EventBadge(EvtType t, bool endTurn) {
-    if (t == EvtType::Assistant) return endTurn ? L"end_turn" : L"tool_use";
-    if (t == EvtType::User)      return L"user";
-    if (t == EvtType::System)    return L"system";
-    return L"event";
+// Same as FormatAgo but always shows seconds — used by the pulse indicator.
+std::wstring FormatAgoFine(LONGLONG ms) {
+    if (ms < 0) ms = 0;
+    if (ms < 1000) return L"now";
+    return std::to_wstring((int)(ms / 1000)) + L"s";
 }
 
-// Build a one-line summary for a row showing project, the most recent event
-// and how long ago it was. The activity dot is drawn separately in PaintRow.
-std::wstring FormatRow(const SessionRow& r) {
-    LONGLONG now = (LONGLONG)GetTickCount64();
-    LONGLONG sinceMs = r.lastEventTsMs ? (now - r.lastEventTsMs) : 0;
-    std::wstring ago = FormatAgo(sinceMs);
-    std::wstring proj = r.projectName.empty()
-                          ? (r.isSubagent ? L"<subagent>" : L"<unknown>")
-                          : r.projectName;
-    std::wstring id = r.shortId;
-
-    std::wstring line;
-    line.reserve(96);
-    line += proj + L" · " + id;
-    line += L"   ";
-    line += ago;
-    line += L" ago · ";
-    line += r.lastEventLabel.empty() ? L"waiting…" : r.lastEventLabel;
-    if (r.isSubagent) line += L" · sub";
-    return line;
-}
-
-// True if the row has shown "Claude doing something" (assistant event) within
-// the last 30 seconds. Within 5s = bright green, otherwise muted.
-bool RowActivelyProcessing(const SessionRow& r, Gdiplus::Color& outColor) {
-    if (!r.lastAssistantMs) return false;
-    LONGLONG age = (LONGLONG)GetTickCount64() - r.lastAssistantMs;
-    if (age < 0) age = 0;
-    if (age > 30 * 1000) return false;
-    // Use u.success-equivalent: bright accent-ish green.
-    outColor = Gdiplus::Color(255, 80, 220, 110);   // bright green
-    if (age > 15 * 1000) {
-        // Fading green.
-        outColor = Gdiplus::Color(140, 80, 220, 110);
+// Color of the leading indicator for a given SM state.
+Gdiplus::Color StateColor(const UIColors& u, State s, bool paused) {
+    if (paused)           return u.muted;
+    switch (s) {
+        case State::Monitoring:  return u.accent;     // cyan
+        case State::IdleWaiting: return u.warn;       // amber
+        case State::Countdown:   return u.warn;       // amber
+        case State::Done:        return u.danger;     // red
     }
-    return true;
+    return u.muted;
 }
 
-// Paint a single row.
+const wchar_t* StateText(State s, bool paused) {
+    if (paused)             return L"PAUSED";
+    switch (s) {
+        case State::Monitoring:  return L"MONITORING";
+        case State::IdleWaiting: return L"IDLE WAITING";
+        case State::Countdown:   return L"COUNTDOWN";
+        case State::Done:        return L"DONE";
+    }
+    return L"?";
+}
+
+// Breathing pulse factor — sin wave 0..1, period 1.6s.
+float Pulse(ULONGLONG nowMs, ULONGLONG startMs) {
+    LONGLONG dt = (LONGLONG)nowMs - (LONGLONG)startMs;
+    if (dt < 0) dt = 0;
+    float t = (float)(dt % 1600) / 1600.0f;
+    return 0.5f - 0.5f * std::cos(t * 6.2831853f);
+}
+
+// Decide how hot (full-bright vs dim) a row's leading bar should be based on
+// whether Claude is actively working (recent assistant event).
+int RowHotLevel(const SessionRow& r) {
+    if (!r.lastAssistantMs) return 0;
+    LONGLONG age = (LONGLONG)GetTickCount64() - r.lastAssistantMs;
+    if (age < 0)     return 0;
+    if (age > 30000) return 0;
+    if (age > 15000) return 1;
+    return 2;
+}
+
+Gdiplus::Color RowHotColor(const UIColors& u, int level) {
+    if (level >= 2) return u.success;
+    if (level >= 1) return u.warn;
+    return u.dim;
+}
+
+// ---------- Drawing helpers (window-local) ----------
+
+void DrawPillBackground(Gdiplus::Graphics& g, const Region& r,
+                        const UIColors& u,
+                        Gdiplus::Color border, bool filled = false) {
+    Gdiplus::RectF rf = r.RectF();
+    if (filled) {
+        FillRound(g, rf, border, 10.0f);
+    } else {
+        FillRoundGradient(g, rf, u.panel, u.bgBottom, 10.0f);
+        DrawRound(g, rf, border, 10.0f, 1.0f);
+    }
+}
+
+void DrawCloseX(Gdiplus::Graphics& g, const Region& r,
+                const UIColors& u, bool hover) {
+    if (hover) {
+        Gdiplus::RectF rf = r.RectF();
+        FillRoundGradient(g, rf,
+            Gdiplus::Color(255, 200,  60,  70),
+            Gdiplus::Color(255, 140,  40,  48),
+            8.0f);
+        DrawRound(g, rf, u.danger, 8.0f, 1.0f);
+    }
+    Gdiplus::Color xc = hover ? u.text : u.textDim;
+    int cx = r.x + r.w / 2;
+    int cy = r.y + r.h / 2;
+    int h  = 5;
+    Gdiplus::Pen xp(xc, 1.5f);
+    xp.SetAlignment(Gdiplus::PenAlignmentInset);
+    g.DrawLine(&xp,
+        Gdiplus::PointF((float)(cx - h), (float)(cy - h)),
+        Gdiplus::PointF((float)(cx + h + 1), (float)(cy + h + 1)));
+    g.DrawLine(&xp,
+        Gdiplus::PointF((float)(cx + h + 1), (float)(cy - h)),
+        Gdiplus::PointF((float)(cx - h), (float)(cy + h + 1)));
+}
+
+void DrawGrip(Gdiplus::Graphics& g, const Region& r,
+              const UIColors& u, bool hover) {
+    Gdiplus::Color c = hover ? u.gripHot : u.grip;
+    Gdiplus::Pen p(c, 1.5f);
+    p.SetAlignment(Gdiplus::PenAlignmentInset);
+    int gx = r.x, gy = r.y;
+    for (int i = 0; i < 3; ++i) {
+        int off = i * 5;
+        g.DrawLine(&p,
+            Gdiplus::PointF((float)(gx + r.w - 4 - off), (float)(gy + r.h - 4)),
+            Gdiplus::PointF((float)(gx + r.w - 4),       (float)(gy + r.h - 4 - off)));
+    }
+}
+
+// One session row. The leading 3px bar is the activity indicator (cyan /
+// amber / emerald / dim); the right dot only appears when the row is the
+// primary. Subagent rows get a tiny "↳" glyph prefix.
 void PaintRow(Gdiplus::Graphics& g, UIColors& u, const SessionRow& r,
               bool isPrimary, int topY, int listW) {
-    Gdiplus::RectF rowRect((float)LIST_X, (float)topY, (float)listW, (float)ROW_H);
+    Gdiplus::RectF rowRect((float)LIST_X, (float)topY,
+                           (float)listW, (float)ROW_H);
+    int radius = 6;
+
+    // Background: panel for primary, panelAlt for non-primary. Selected
+    // gets a slightly elevated gradient so it reads as the "lead" row.
     if (isPrimary) {
-        Gdiplus::SolidBrush bg(u.bgAlt);
-        g.FillRectangle(&bg, rowRect);
+        FillRoundGradient(g, rowRect, u.panelAlt,
+                          Gdiplus::Color(255, 27, 31, 40), (float)radius);
+        DrawRound(g, rowRect, u.divider, (float)radius, 1.0f);
+    } else {
+        FillRound(g, rowRect, u.panel, (float)radius);
     }
 
-    Gdiplus::Font rFont(L"Segoe UI", 9.5f, isPrimary ? Gdiplus::FontStyleBold
-                                                      : Gdiplus::FontStyleRegular);
-    Gdiplus::Color txt = isPrimary ? u.text : u.muted;
-    // Reserve the right ~14 px for the activity dot.
-    Gdiplus::RectF textRect = rowRect;
-    textRect.Width -= 14.0f;
-    DrawCentered(g, FormatRow(r).c_str(), textRect, rFont, txt);
+    // Leading 3px activity bar.
+    int hot = RowHotLevel(r);
+    Gdiplus::Color barColor = isPrimary ? u.accent : RowHotColor(u, hot);
+    Gdiplus::SolidBrush bar(barColor);
+    g.FillRectangle(&bar, (float)LIST_X + 4, (float)topY + 3,
+                    3.0f, (float)ROW_H - 6);
 
-    if (isPrimary) {
-        // Left bar marker.
-        Gdiplus::SolidBrush bar(u.accent);
-        g.FillRectangle(&bar, (float)(LIST_X - 3), (float)topY,
-                        3.0f, (float)ROW_H);
-    }
+    // Subagent little arrow + project name (left-aligned at x = LIST_X+12).
+    Gdiplus::RectF textRect(rowRect.X + 12, rowRect.Y,
+                            rowRect.Width - 24, rowRect.Height);
+    std::wstring label;
+    label.reserve(96);
+    label += r.isSubagent ? L"  " L"↳" L"  " : L"";
+    label += r.projectName.empty()
+                  ? (r.isSubagent ? L"<subagent>" : L"<unknown>")
+                  : r.projectName;
+    Gdiplus::Color txt = isPrimary ? u.text : u.textDim;
+    DrawLabelLeft(g, label.c_str(), textRect,
+                 L"Segoe UI", 11.0f,
+                 isPrimary ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular,
+                 txt);
 
-    // Right-edge activity dot: green if a recent assistant event arrived
-    // (Claude is actually doing something); muted otherwise (user typing,
-    // completed session, no parsed events).
-    {
-        Gdiplus::Color dotColor = u.muted;
-        bool active = RowActivelyProcessing(r, dotColor);
-        if (active) {
-            Gdiplus::SolidBrush dot(dotColor);
-            float cx = LIST_X + listW - 8.0f;
-            float cy = (float)topY + ROW_H / 2.0f;
-            g.FillEllipse(&dot, cx - 4.0f, cy - 4.0f, 8.0f, 8.0f);
-        } else {
-            // Hollow ring.
-            Gdiplus::Pen ring(u.muted, 1.0f);
-            float cx = LIST_X + listW - 8.0f;
-            float cy = (float)topY + ROW_H / 2.0f;
-            g.DrawEllipse(&ring, cx - 3.0f, cy - 3.0f, 6.0f, 6.0f);
-        }
-    }
+    // Right cluster: ago (mono) + small dot.
+    std::wstring ago = FormatAgoFine(
+        r.lastEventTsMs ? (LONGLONG)GetTickCount64() - r.lastEventTsMs : 0);
+    Gdiplus::RectF agoRect(rowRect.X + rowRect.Width - 70,
+                           rowRect.Y, 50, rowRect.Height);
+    DrawLabel(g, ago.c_str(), agoRect,
+             L"Cascadia Mono", 10.0f,
+             Gdiplus::FontStyleRegular, u.muted);
+
+    Gdiplus::Color dotC = isPrimary ? u.accent : u.muted;
+    Gdiplus::SolidBrush dotB(dotC);
+    float dDot = 7.0f;
+    float dcx = rowRect.X + rowRect.Width - 12;
+    float dcy = rowRect.Y + rowRect.Height / 2.0f;
+    g.FillEllipse(&dotB, dcx - dDot/2, dcy - dDot/2, dDot, dDot);
+
+    // Event label on the row underneath the title? We do it inline as a 2nd
+    // text layer below the project name when there's vertical space; for
+    // ROW_H=22 we don't, so the label info shows up only via hover state —
+    // (out of scope, keep rows single-line for now).
 }
 
 void Paint(HWND hwnd) {
@@ -279,53 +369,123 @@ void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
 
-    // Double buffer: render to a bitmap, then blit.
-    int W = c->layout.winW;
-    int H = c->layout.winH;
+    int W = c->layout.winW, H = c->layout.winH;
     Gdiplus::Bitmap bmp(W, H, PixelFormat32bppARGB);
     Gdiplus::Graphics g(&bmp);
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQuality);
     UIColors u;
 
-    g.Clear(u.bg);
+    // ---- Backdrop ----
+    FillVGradient(g, Gdiplus::Rect(0, 0, W, H), u.bgTop, u.bgBottom);
+    // 1px scanlines every 3px, very faint, gives texture without noise.
+    DrawScanlines(g, Gdiplus::Rect(0, 0, W, H),
+                  Gdiplus::Color(14, 255, 255, 255), 3);
 
-    // Title bar
-    Gdiplus::SolidBrush tb(u.bgAlt);
-    g.FillRectangle(&tb, 0, 0, W, c->layout.title.h);
-    Gdiplus::Font titleFont(L"Segoe UI", 12, Gdiplus::FontStyleBold);
-    DrawCentered(g, L"AutoClaude — session monitor",
-                 c->layout.title.Rect(), titleFont, u.text);
+    // ---- Title strip ----
+    Region titleR = c->layout.title;
+    FillVGradient(g, titleR.Rect(), u.panelAlt,
+                  Gdiplus::Color(255, 22, 26, 34));
+    // Left edge accent.
+    Gdiplus::SolidBrush accB(u.accent);
+    g.FillRectangle(&accB, 0, 0, 4, titleR.h);
+    DrawHairline(g, 0, titleR.h - 1, W, u.divider);
+    DrawLabel(g, L"AUTOCLAUDE",
+             Gdiplus::RectF((float)titleR.x + 14, (float)titleR.y,
+                            (float)titleR.w - 60, (float)titleR.h),
+             L"Segoe UI", 14.0f, Gdiplus::FontStyleBold,
+             u.text,
+             Gdiplus::StringAlignmentNear,
+             Gdiplus::StringAlignmentCenter);
+    DrawLabel(g, L"session monitor",
+             Gdiplus::RectF((float)titleR.x + 130, (float)titleR.y,
+                            220, (float)titleR.h),
+             L"Segoe UI", 10.0f, Gdiplus::FontStyleRegular,
+             u.muted,
+             Gdiplus::StringAlignmentNear,
+             Gdiplus::StringAlignmentCenter);
 
-    // Status: state · N active · window Ms  (or just "no active sessions")
-    std::wstring status;
-    if (c->sessions.empty()) {
-        status = c->paused ? L"PAUSED · no active sessions"
-                           : L"no active sessions · waiting";
-    } else {
-        status = c->sm.StateName();
-        status += L"  ·  ";
-        status += std::to_wstring((int)c->sessions.size());
-        status += L" active  ·  window ";
-        status += std::to_wstring(c->cfg.activeWindowSec);
-        status += L"s";
-        if (c->paused) status += L"  ·  PAUSED";
-        if (!c->doneMsg.empty()) status = c->doneMsg;
+    // ---- Close X ----
+    DrawCloseX(g, c->layout.closeBtn, u, c->hoverClose);
+
+    // ---- Status row: colored dot + state badge + counters ----
+    Region statR = c->layout.status;
+    ULONGLONG now = GetTickCount64();
+    bool isPulsingState = !c->paused &&
+        (c->sm.state == State::Monitoring ||
+         c->sm.state == State::IdleWaiting ||
+         c->sm.state == State::Countdown);
+    float pulse = isPulsingState ? Pulse(now, c->pulseStartMs) : 0.0f;
+
+    Gdiplus::Color dotColor = StateColor(u, c->sm.state, c->paused);
+    if (isPulsingState) {
+        int boost = (int)(pulse * 90.0f);
+        dotColor = Gdiplus::Color(
+            255,
+            (BYTE)std::min(255, (int)dotColor.GetR() + boost/3),
+            (BYTE)std::min(255, (int)dotColor.GetG() + boost/3),
+            (BYTE)std::min(255, (int)dotColor.GetB() + boost/3));
     }
-    Gdiplus::Font sFont(L"Segoe UI", 10);
-    DrawCentered(g, status.c_str(),
-                 Gdiplus::RectF(20, 44, (float)(W - 40), 26), sFont, u.muted);
 
-    // Sessions list
-    // Clamp scroll offset so we don't over-scroll when the list shrinks.
+    // Leading state dot.
+    Gdiplus::SolidBrush dotB(dotColor);
+    float dotD = 9.0f;
+    g.FillEllipse(&dotB, (float)statR.x, (float)statR.y + (statR.h - dotD) / 2,
+                  dotD, dotD);
+
+    // State name + counters.
+    std::wstring left = StateText(c->sm.state, c->paused);
+    std::wstring right;
+    if (!c->doneMsg.empty()) {
+        right = c->doneMsg;
+    } else if (c->sessions.empty()) {
+        right = L"no active sessions · waiting";
+    } else {
+        right = std::to_wstring((int)c->sessions.size()) + L" active · window "
+              + std::to_wstring(c->cfg.activeWindowSec) + L"s";
+        if (c->paused) right += L" · PAUSED";
+    }
+    DrawLabel(g, left.c_str(),
+             Gdiplus::RectF((float)statR.x + 18, (float)statR.y,
+                            230, (float)statR.h),
+             L"Segoe UI", 11.5f, Gdiplus::FontStyleBold, u.text,
+             Gdiplus::StringAlignmentNear,
+             Gdiplus::StringAlignmentCenter);
+    DrawLabel(g, right.c_str(),
+             Gdiplus::RectF((float)statR.x + 240, (float)statR.y,
+                            (float)statR.w - 260, (float)statR.h),
+             L"Segoe UI", 11.0f, Gdiplus::FontStyleRegular, u.muted,
+             Gdiplus::StringAlignmentNear,
+             Gdiplus::StringAlignmentCenter);
+
+    // Countdown bar (only when state == Countdown).
+    if (c->sm.state == State::Countdown && !c->paused) {
+        int barX = statR.x + 18;
+        int barY = statR.y + statR.h - 5;
+        int barW = statR.w - 36;
+        int barH = 3;
+        float frac = (float)c->sm.countdownRemaining /
+                     (float)std::max(1, c->cfg.countdownSec);
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+        Gdiplus::SolidBrush track(u.divider);
+        g.FillRectangle(&track, (float)barX, (float)barY,
+                        (float)barW, (float)barH);
+        Gdiplus::SolidBrush fill(u.warn);
+        g.FillRectangle(&fill, (float)barX, (float)barY,
+                        (float)(barW * frac), (float)barH);
+    }
+
+    // ---- Sessions list ----
     int visible = c->layout.listVisibleRows;
     int maxOffset = (int)c->sessions.size() > visible
-                      ? (int)c->sessions.size() - visible
-                      : 0;
+                      ? (int)c->sessions.size() - visible : 0;
     if (c->scrollOffset > maxOffset) c->scrollOffset = maxOffset;
     if (c->scrollOffset < 0) c->scrollOffset = 0;
 
     int listW = c->layout.list.w;
-    int rowsToShow = std::min<int>((int)c->sessions.size() - c->scrollOffset, visible);
+    int rowsToShow = std::min<int>((int)c->sessions.size() - c->scrollOffset,
+                                    visible);
     for (int i = 0; i < rowsToShow; ++i) {
         const SessionRow& r = c->sessions[c->scrollOffset + i];
         bool isPrimary = (r.path == c->primaryPath);
@@ -333,125 +493,150 @@ void Paint(HWND hwnd) {
         PaintRow(g, u, r, isPrimary, topY, listW);
     }
     if (c->sessions.empty()) {
-        std::wstring empty = L"(no .jsonl files modified in the last "
+        std::wstring empty = L"no .jsonl files modified in the last "
                            + std::to_wstring(c->cfg.activeWindowSec)
-                           + L" seconds)";
-        Gdiplus::Font f(L"Segoe UI", 9, Gdiplus::FontStyleItalic);
-        DrawCentered(g, empty.c_str(), c->layout.list.Rect(), f, u.muted);
+                           + L"s";
+        DrawLabel(g, empty.c_str(),
+                 Gdiplus::RectF((float)c->layout.list.x,
+                                (float)c->layout.list.y,
+                                (float)c->layout.list.w,
+                                (float)c->layout.list.h),
+                 L"Segoe UI", 11.0f,
+                 Gdiplus::FontStyleItalic, u.dim);
     } else if ((int)c->sessions.size() > visible) {
-        // Scroll hint in the bottom-right corner of the list.
-        std::wstring hint = std::to_wstring(c->scrollOffset + 1) + L"-"
-                          + std::to_wstring(std::min<int>(
-                                c->scrollOffset + visible,
-                                (int)c->sessions.size()))
-                          + L" of " + std::to_wstring((int)c->sessions.size())
-                          + L"  ·  scroll";
-        Gdiplus::Font hFont(L"Segoe UI", 8);
-        DrawCentered(g, hint.c_str(),
-                     Gdiplus::RectF(20, (float)(LIST_Y + c->layout.list.h + 2),
-                                    (float)listW, 14), hFont, u.muted);
+        int endIdx = std::min<int>(c->scrollOffset + visible,
+                                    (int)c->sessions.size());
+        std::wstring hint = std::to_wstring(c->scrollOffset + 1) + L"–"
+                          + std::to_wstring(endIdx) + L"  of  "
+                          + std::to_wstring((int)c->sessions.size());
+        DrawLabel(g, hint.c_str(),
+                 Gdiplus::RectF((float)(c->layout.list.x),
+                                (float)(LIST_Y + c->layout.list.h + 4),
+                                (float)listW, 14),
+                 L"Cascadia Mono", 9.0f,
+                 Gdiplus::FontStyleRegular, u.dim);
     }
 
-    // Action pills
+    // ---- Action pills ----
     const wchar_t* names[4] = { L"Shutdown", L"Restart", L"Hibernate", L"Lock" };
-    Gdiplus::Font pFont(L"Segoe UI", 11, Gdiplus::FontStyleBold);
     for (int i = 0; i < 4; ++i) {
         bool sel = (c->cfg.action == i);
-        Gdiplus::RectF r = c->layout.pills[i].Rect();
-        if (sel) {
-            FillRound(g, r, u.accent, 10);
-            DrawCentered(g, names[i], r, pFont, Gdiplus::Color(255, 255, 255, 255));
-        } else {
-            FillRound(g, r, u.bgAlt, 10);
-            DrawRound(g, r, u.muted, 10, 1.5f);
-            DrawCentered(g, names[i], r, pFont, u.text);
-        }
+        bool hot = (c->hoverPill == i);
+        Region r = c->layout.pills[i];
+        Gdiplus::RectF rf = r.RectF();
+        Gdiplus::Color border = sel ? u.accent
+                          : hot    ? u.gripHot
+                                   : u.divider;
+        Gdiplus::Color fillT  = sel ? u.accentDeep
+                          : hot    ? u.panelHi
+                                   : u.panel;
+        Gdiplus::Color fillB  = sel ? Gdiplus::Color(255,  8, 50, 82)
+                          : hot    ? Gdiplus::Color(255, 35, 41, 52)
+                                   : u.bgBottom;
+        FillRoundGradient(g, rf, fillT, fillB, 10.0f);
+        DrawRound(g, rf, border, 10.0f, sel ? 1.5f : 1.0f);
+        Gdiplus::Color tColor = sel ? u.text
+                          : hot    ? u.textDim
+                                   : u.textDim;
+        int style = sel ? Gdiplus::FontStyleBold : Gdiplus::FontStyleBold;
+        DrawLabel(g, names[i], rf,
+                 L"Segoe UI", 12.0f, style, tColor);
     }
 
-    // Buttons
-    Gdiplus::Font bFont(L"Segoe UI", 11, Gdiplus::FontStyleBold);
-    // Cancel (only meaningful during countdown)
+    // ---- Cancel + Start/Pause buttons ----
+    // Cancel: only meaningful during countdown; danger color when armed.
     {
-        bool active = (c->sm.state == State::Countdown);
-        Gdiplus::RectF r = c->layout.cancelBtn.Rect();
-        if (active) {
-            FillRound(g, r, u.danger, 10);
-            DrawCentered(g, L"Cancel", r, bFont, Gdiplus::Color(255, 255, 255, 255));
+        Region r = c->layout.cancelBtn;
+        bool armed = (c->sm.state == State::Countdown) && !c->paused;
+        bool hot = c->hoverCancel;
+        Gdiplus::RectF rf = r.RectF();
+        if (armed) {
+            FillRoundGradient(g, rf,
+                Gdiplus::Color(255, 200, 80, 80),
+                Gdiplus::Color(255, 160, 50, 50),
+                10.0f);
+            DrawRound(g, rf, u.danger, 10.0f, 1.5f);
         } else {
-            FillRound(g, r, u.bgAlt, 10);
-            DrawRound(g, r, u.muted, 10, 1.5f);
-            DrawCentered(g, L"Cancel", r, bFont, u.muted);
+            Gdiplus::Color fillT = hot ? u.panelHi : u.panel;
+            FillRoundGradient(g, rf, fillT, u.bgBottom, 10.0f);
+            DrawRound(g, rf, hot ? u.gripHot : u.divider, 10.0f, 1.0f);
         }
+        // 2-line label: "Cancel" / "abort countdown"
+        Gdiplus::Color cT = armed ? u.text : u.text;
+        Gdiplus::Color cC = armed ? Gdiplus::Color(255, 255, 230, 230)
+                                  : u.dim;
+        Gdiplus::RectF topRect(rf.X, rf.Y + 4, rf.Width, rf.Height / 2 - 2);
+        Gdiplus::RectF subRect(rf.X, rf.Y + rf.Height / 2 + 2,
+                               rf.Width, rf.Height / 2 - 4);
+        DrawLabel(g, L"Cancel", topRect,
+                  L"Segoe UI", 11.5f, Gdiplus::FontStyleBold, cT);
+        DrawLabel(g, armed ? L"scheduled action" : L"abort countdown",
+                  subRect,
+                  L"Segoe UI", 8.5f, Gdiplus::FontStyleRegular, cC);
     }
-    // Start/Pause
+    // Pause / Resume
     {
-        Gdiplus::RectF r = c->layout.startBtn.Rect();
-        const wchar_t* label = c->paused ? L"Resume" : L"Pause";
+        Region r = c->layout.startBtn;
+        bool hot = c->hoverStart;
+        Gdiplus::RectF rf = r.RectF();
         if (c->paused) {
-            FillRound(g, r, u.accent, 10);
-            DrawCentered(g, label, r, bFont, Gdiplus::Color(255, 255, 255, 255));
+            FillRoundGradient(g, rf, u.accentDeep,
+                              Gdiplus::Color(255,  8, 50, 82), 10.0f);
+            DrawRound(g, rf, u.accent, 10.0f, 1.5f);
+            DrawLabel(g, L"Resume", rf,
+                     L"Segoe UI", 11.5f,
+                     Gdiplus::FontStyleBold, u.text);
+            DrawLabel(g, L"halt monitoring", rf,
+                     L"Segoe UI", 8.5f,
+                     Gdiplus::FontStyleRegular,
+                     Gdiplus::Color(255, 200, 230, 250));
         } else {
-            FillRound(g, r, u.bgAlt, 10);
-            DrawRound(g, r, u.muted, 10, 1.5f);
-            DrawCentered(g, label, r, bFont, u.text);
+            Gdiplus::Color fillT = hot ? u.panelHi : u.panel;
+            FillRoundGradient(g, rf, fillT, u.bgBottom, 10.0f);
+            DrawRound(g, rf, hot ? u.gripHot : u.divider, 10.0f, 1.0f);
+            DrawLabel(g, L"Pause",
+                     Gdiplus::RectF(rf.X, rf.Y + 4, rf.Width,
+                                    rf.Height / 2 - 2),
+                     L"Segoe UI", 11.5f,
+                     Gdiplus::FontStyleBold, u.text);
+            DrawLabel(g, L"halt monitoring",
+                     Gdiplus::RectF(rf.X, rf.Y + rf.Height / 2 + 2,
+                                    rf.Width, rf.Height / 2 - 4),
+                     L"Segoe UI", 8.5f,
+                     Gdiplus::FontStyleRegular, u.dim);
         }
     }
 
-    // Close X — drawn at integer coordinates with a chunkier pen so the
-    // anti-aliasing has enough pixels to produce a crisp diagonal.
-    {
-        Gdiplus::RectF r = c->layout.closeBtn.Rect();
-        Gdiplus::Pen xp(u.text, 2.0f);
-        // Snap to integer pixels so GDI+ doesn't blur to half-pixel grid.
-        float x1 = (float)((int)r.X + 9);
-        float y1 = (float)((int)r.Y + 7);
-        float x2 = (float)((int)r.X + 21);
-        float y2 = (float)((int)r.Y + 19);
-        g.DrawLine(&xp, x1, y1, x2, y2);
-        g.DrawLine(&xp, x2, y1, x1, y2);
-    }
-
-    // Footer (dry-run + a one-line SM state readout for the primary).
-    // Lives just above the resize grip; uses layout.winH as the anchor.
-    Gdiplus::Font fFont(L"Segoe UI", 8.5f);
-    std::wstring foot = c->cfg.dryRun ? L"DRY-RUN · " : L"LIVE · ";
+    // ---- Footer ----
+    int footerY = H - 22;
+    std::wstring foot = c->cfg.dryRun ? L"DRY-RUN" : L"LIVE";
     if (!c->doneMsg.empty()) {
-        foot += c->doneMsg;
+        // Done message shown in footer instead of "primary:" path tail.
     } else if (c->sm.state == State::Countdown) {
-        foot += std::to_wstring(c->sm.countdownRemaining) + L"s until action";
+        foot = std::to_wstring(c->sm.countdownRemaining) + L"s";
+        foot += c->cfg.dryRun ? L"  ·  DRY-RUN" : L"  ·  LIVE";
     } else if (c->sm.state == State::IdleWaiting) {
-        LONGLONG now = (LONGLONG)GetTickCount64();
-        LONGLONG rem = (c->sm.idleDeadlineMs - now) / 1000;
+        LONGLONG rem = (c->sm.idleDeadlineMs - (LONGLONG)now) / 1000;
         if (rem < 0) rem = 0;
-        foot += L"idle " + std::to_wstring((int)rem) + L"s";
+        foot = std::to_wstring((int)rem) + L"s idle";
+        foot += c->cfg.dryRun ? L"  ·  DRY-RUN" : L"  ·  LIVE";
     } else {
-        foot += L"primary: " + c->primaryPath;
-        // Keep the path short in the footer.
+        foot += L"  ·  primary: " + c->primaryPath;
         size_t from = foot.size() > 60 ? foot.size() - 60 : 0;
         foot = (from > 0 ? L"…" : L"") + foot.substr(from);
     }
-    DrawCentered(g, foot.c_str(),
-                 Gdiplus::RectF(20, (float)(H - 22), (float)(W - 40), 18),
-                 fFont, u.muted);
+    DrawHairline(g, 0, footerY - 2, W, u.divider);
+    DrawLabelLeft(g, foot.c_str(),
+                 Gdiplus::RectF(20, (float)footerY, (float)(W - 40), 18),
+                 L"Cascadia Mono", 9.0f,
+                 Gdiplus::FontStyleRegular, u.muted);
 
-    // Resize grip — three diagonal lines tucked into the bottom-right
-    // corner. Drawn last so nothing paints over it.
-    {
-        Gdiplus::Pen gripPen(u.muted, 1.5f);
-        const Region& gr = c->layout.grip;
-        int gx = gr.x;
-        int gy = gr.y;
-        for (int i = 0; i < 3; ++i) {
-            // Each line steps up-and-left from the bottom-right corner.
-            int off = i * 5;
-            g.DrawLine(&gripPen,
-                       (float)(gx + gr.w - 3 - off), (float)(gy + gr.h - 3),
-                       (float)(gx + gr.w - 3),          (float)(gy + gr.h - 3 - off));
-        }
-    }
+    // ---- Grip ----
+    DrawGrip(g, c->layout.grip, u, c->hoverGrip);
 
-    // Blit to screen.
+    // Blit.
     Gdiplus::Graphics sg(hdc);
+    sg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     sg.DrawImage(&bmp, 0, 0);
 
     EndPaint(hwnd, &ps);
@@ -466,24 +651,23 @@ void OnSessionEvent(HWND hwnd, SessionEvent* se) {
         SessionRow& r = c->sessions[rowIdx];
         r.eventsCount++;
         r.lastEventTsMs = se->e.ts_ms;
-
         const wchar_t* label = L"event";
         if (se->e.type == EvtType::Assistant) {
             r.lastAssistantMs = se->e.ts_ms;
-            label = se->e.is_end_turn ? L"assistant: end_turn"
-                                       : L"assistant: working";
+            label = se->e.is_end_turn ? L"assistant end_turn"
+                                       : L"assistant working";
         } else if (se->e.type == EvtType::User) {
             label = L"user message";
         } else if (se->e.type == EvtType::System) {
-            label = se->e.is_api_error ? L"system: api_error"
+            label = se->e.is_api_error ? L"system api_error"
                                          : L"system event";
         }
         r.lastEventLabel = label;
     }
     c->doneMsg.clear();
 
-    // The state machine only listens to the primary session's events.
-    if (!c->paused && rowIdx >= 0 && c->sessions[rowIdx].path == c->primaryPath) {
+    if (!c->paused && rowIdx >= 0 &&
+        c->sessions[rowIdx].path == c->primaryPath) {
         c->sm.OnEvent(se->e, c->cfg.idleTimeoutSec);
     }
     DLog(L"[evt] %s type=%d end_turn=%d -> state=%d",
@@ -500,13 +684,12 @@ void OnSessionsUpdate(HWND hwnd, const std::vector<TrackInfo>* snap) {
     if (snap->empty()) {
         c->sessions.clear();
     } else {
-        // Rebuild sessions, preserving per-row state for paths we already knew.
         std::vector<SessionRow> fresh;
         fresh.reserve(snap->size());
         for (const auto& ti : *snap) {
             int old = c->FindRow(ti.path);
             if (old >= 0) {
-                fresh.push_back(c->sessions[old]);   // keep counters / labels
+                fresh.push_back(c->sessions[old]);
                 fresh.back().path = ti.path;
                 fresh.back().projectName = ti.projectName;
                 fresh.back().shortId = ti.shortId;
@@ -517,17 +700,14 @@ void OnSessionsUpdate(HWND hwnd, const std::vector<TrackInfo>* snap) {
                 r.projectName = ti.projectName;
                 r.shortId = ti.shortId;
                 r.isSubagent = ti.isSubagent;
-                r.lastEventLabel = L"waiting for events…";
+                r.lastEventLabel = L"waiting…";
                 fresh.push_back(std::move(r));
             }
         }
         c->sessions = std::move(fresh);
     }
-
-    // Track the primary. Index 0 is newest mtime — that's the one driving the SM.
     c->primaryPath = c->sessions.empty() ? L"" : c->sessions[0].path;
     c->PrunePrimaryIfGone();
-
     DLog(L"[sessions] snapshot: %zu active, primary=%s",
          c->sessions.size(), c->primaryPath.c_str());
     delete snap;
@@ -537,26 +717,76 @@ void OnSessionsUpdate(HWND hwnd, const std::vector<TrackInfo>* snap) {
 void OnTimerTick(HWND hwnd) {
     AppCtx* c = Ctx(hwnd);
     if (!c) return;
-    if (c->paused) return;
-    if (c->sm.state == State::Countdown || c->sm.state == State::IdleWaiting) {
-        bool zero = c->sm.OnTimer(c->cfg.countdownSec);
-        DLog(L"[timer] state=%d countdown=%d zero=%d",
-             (int)c->sm.state, c->sm.countdownRemaining, zero ? 1 : 0);
-        if (zero) {
-            Action a = c->Selected();
-            const wchar_t* msg = PerformPowerAction(a, c->cfg.dryRun);
-            DLog(L"[power] action=%d dryRun=%d msg=%s",
-                 (int)a, c->cfg.dryRun ? 1 : 0, msg ? msg : L"(null)");
-            if (c->cfg.dryRun) {
-                c->doneMsg = std::wstring(L"DONE (dry-run) · ")
-                           + ActionLong(c->cfg.action);
-            } else {
-                c->doneMsg = L"performed: ";
-                c->doneMsg += msg;
+
+    if (!c->paused) {
+        if (c->sm.state == State::Countdown ||
+            c->sm.state == State::IdleWaiting) {
+            bool zero = c->sm.OnTimer(c->cfg.countdownSec);
+            DLog(L"[timer] state=%d countdown=%d zero=%d",
+                 (int)c->sm.state, c->sm.countdownRemaining, zero ? 1 : 0);
+            if (zero) {
+                Action a = c->Selected();
+                const wchar_t* msg = PerformPowerAction(a, c->cfg.dryRun);
+                DLog(L"[power] action=%d dryRun=%d msg=%s",
+                     (int)a, c->cfg.dryRun ? 1 : 0, msg ? msg : L"(null)");
+                if (c->cfg.dryRun) {
+                    c->doneMsg = std::wstring(L"DONE (dry-run) ")
+                               + ActionLong(c->cfg.action);
+                } else {
+                    c->doneMsg = std::wstring(L"performed: ")
+                               + (msg ? msg : L"");
+                }
             }
         }
+    }
+    // Repaint every tick: drives the pulse animation + countdown progress.
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void OnMouseMove(HWND hwnd, int x, int y) {
+    AppCtx* c = Ctx(hwnd);
+    if (!c) return;
+    bool hClose  = c->layout.closeBtn.Contains(x, y);
+    bool hGrip   = c->layout.grip.Contains(x, y);
+    bool hCancel = c->layout.cancelBtn.Contains(x, y);
+    bool hStart  = c->layout.startBtn.Contains(x, y);
+    int  hPill   = -1;
+    for (int i = 0; i < 4; ++i)
+        if (c->layout.pills[i].Contains(x, y)) { hPill = i; break; }
+    bool dirty = (hClose  != c->hoverClose)  ||
+                 (hGrip   != c->hoverGrip)   ||
+                 (hCancel != c->hoverCancel) ||
+                 (hStart  != c->hoverStart)  ||
+                 (hPill   != c->hoverPill);
+    if (dirty) {
+        c->hoverClose  = hClose;
+        c->hoverGrip   = hGrip;
+        c->hoverCancel = hCancel;
+        c->hoverStart  = hStart;
+        c->hoverPill   = hPill;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
+    if (!c->trackingMouseLeave) {
+        TRACKMOUSEEVENT tme{};
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        TrackMouseEvent(&tme);
+        c->trackingMouseLeave = true;
+    }
+}
+
+void OnMouseLeave(HWND hwnd) {
+    AppCtx* c = Ctx(hwnd);
+    if (!c) return;
+    bool dirty = c->hoverClose || c->hoverGrip ||
+                 c->hoverCancel || c->hoverStart ||
+                 c->hoverPill >= 0;
+    c->hoverClose = c->hoverGrip = c->hoverCancel =
+        c->hoverStart = false;
+    c->hoverPill = -1;
+    c->trackingMouseLeave = false;
+    if (dirty) InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 void OnLButtonDown(HWND hwnd, int x, int y) {
@@ -564,8 +794,10 @@ void OnLButtonDown(HWND hwnd, int x, int y) {
     if (!c) return;
     auto& L = c->layout;
 
-    if (L.closeBtn.Contains(x, y)) { PostMessageW(hwnd, WM_CLOSE, 0, 0); return; }
-
+    if (L.closeBtn.Contains(x, y)) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
     for (int i = 0; i < 4; ++i) {
         if (L.pills[i].Contains(x, y)) {
             c->cfg.action = i;
@@ -574,7 +806,8 @@ void OnLButtonDown(HWND hwnd, int x, int y) {
             return;
         }
     }
-    if (L.cancelBtn.Contains(x, y) && c->sm.state == State::Countdown) {
+    if (L.cancelBtn.Contains(x, y) &&
+        c->sm.state == State::Countdown && !c->paused) {
         c->sm.Cancel();
         c->doneMsg.clear();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -593,36 +826,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CREATE: {
             auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-            SetTimer(hwnd, 1, 1000, nullptr);
+            SetTimer(hwnd, 1, 250, nullptr);    // 4Hz for pulse + countdown bar
+            AppCtx* c = Ctx(hwnd);
+            if (c) c->pulseStartMs = GetTickCount64();
             return 0;
         }
         case WM_PAINT: Paint(hwnd); return 0;
-        case WM_LBUTTONDOWN: OnLButtonDown(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
+        case WM_LBUTTONDOWN:
+            OnLButtonDown(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+        case WM_MOUSEMOVE:
+            OnMouseMove(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+        case WM_MOUSELEAVE:
+            OnMouseLeave(hwnd);
+            return 0;
+        case WM_SETCURSOR: {
+            if (LOWORD(lp) == HTCLIENT) {
+                AppCtx* c = Ctx(hwnd);
+                // IDC_* are macros that expand to LPWSTR; the cursor load
+                // happens at SetCursor time.
+                LPCWSTR id = IDC_ARROW;
+                if (c) {
+                    if (c->hoverGrip)                              id = IDC_SIZENWSE;
+                    else if (c->hoverClose || c->hoverPill >= 0 ||
+                             c->hoverCancel || c->hoverStart)       id = IDC_HAND;
+                }
+                SetCursor(LoadCursor(nullptr, id));
+                return TRUE;
+            }
+            return FALSE;
+        }
         case WM_MOUSEWHEEL: {
             AppCtx* c = Ctx(hwnd);
             if (!c) return 0;
             int delta = GET_WHEEL_DELTA_WPARAM(wp);
-            int step = -delta / WHEEL_DELTA;   // up = -delta
-            int maxOff = std::max<int>(0, (int)c->sessions.size() - c->layout.listVisibleRows);
+            int step = -delta / WHEEL_DELTA;
+            int maxOff = std::max<int>(0,
+                (int)c->sessions.size() - c->layout.listVisibleRows);
             c->scrollOffset = std::max<int>(0,
-                                std::min<int>(maxOff, c->scrollOffset + step));
+                std::min<int>(maxOff, c->scrollOffset + step));
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         case WM_SIZE: {
             AppCtx* c = Ctx(hwnd);
             if (!c) return 0;
-            int w = LOWORD(lp);
-            int h = HIWORD(lp);
+            int w = LOWORD(lp), h = HIWORD(lp);
             if (w <= 0 || h <= 0) return 0;
             c->layout.Recompute(w, h);
-            // Clamp scroll offset against the new row count.
-            int maxOff = std::max<int>(0, (int)c->sessions.size() - c->layout.listVisibleRows);
+            int maxOff = std::max<int>(0,
+                (int)c->sessions.size() - c->layout.listVisibleRows);
             if (c->scrollOffset > maxOff) c->scrollOffset = maxOff;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
-        case WM_TIMER: if (wp == 1) OnTimerTick(hwnd); return 0;
+        case WM_TIMER:
+            if (wp == 1) OnTimerTick(hwnd);
+            return 0;
         case WM_APP_EVT:
             OnSessionEvent(hwnd, reinterpret_cast<SessionEvent*>(lp));
             return 0;
@@ -631,21 +892,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 reinterpret_cast<const std::vector<TrackInfo>*>(lp));
             return 0;
         case WM_NCHITTEST: {
+            // Default for the entire client area is HTCLIENT — this routes
+            // mouse clicks through WM_LBUTTONDOWN so OnLButtonDown can route
+            // them to whatever they hit (close, pills, buttons). Returning
+            // HTCLOSE here would route to WM_NCLBUTTONDOWN, where nothing
+            // closes the window (DefWindowProc does NOT auto-close on
+            // HTCLOSE) — that's why the close X was unresponsive.
             POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ScreenToClient(hwnd, &p);
             AppCtx* c = Ctx(hwnd);
             if (c) {
-                if (c->layout.closeBtn.Contains(p.x, p.y)) return HTCLOSE;
-                if (c->layout.grip.Contains(p.x, p.y))    return HTBOTTOMRIGHT;
-                if (c->layout.title.Contains(p.x, p.y))   return HTCAPTION;
+                if (c->layout.grip.Contains(p.x, p.y))  return HTBOTTOMRIGHT;
+                if (c->layout.title.Contains(p.x, p.y)) return HTCAPTION;
             }
             return HTCLIENT;
         }
         case WM_NCCALCSIZE: {
-            // With WS_THICKFRAME set on the window, the system would normally
-            // reserve a non-client border (caption + sizing frame). We render
-            // the whole surface ourselves in WM_PAINT, so suppress the
-            // non-client area entirely by reporting that no borders exist.
             if (wp) {
                 return WVR_ALIGNTOP | WVR_ALIGNLEFT
                      | WVR_ALIGNBOTTOM | WVR_ALIGNRIGHT;
@@ -676,10 +938,14 @@ void RunApp(const Config& initialCfg) {
          initialCfg.project.c_str(),
          initialCfg.activeWindowSec);
 
+    // Opt in to system DPI awareness so GDI+ doesn't render the whole
+    // surface as a small bitmap that gets scaled up on HiDPI displays
+    // (the cause of the apparent fuzziness on 4K monitors).
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+
     auto ctx = std::make_unique<AppCtx>();
     ctx->cfg = initialCfg;
     ctx->exeDir = ExeDir();
-    if (initialCfg.dryRun) ctx->dryRunNotice = L"DRY-RUN";
 
     const wchar_t* kClass = L"AutoClaudeClass";
     WNDCLASSEXW wc{};

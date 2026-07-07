@@ -21,7 +21,7 @@ add_executable(AutoClaude WIN32
 target_include_directories(AutoClaude PRIVATE src)
 
 target_link_libraries(AutoClaude PRIVATE
-  gdi32 user32 advapi32 powrprof shell32 gdiplus ole32
+  gdi32 user32 advapi32 powrprof shell32 shcore gdiplus ole32
   nlohmann_json::nlohmann_json
 )
 

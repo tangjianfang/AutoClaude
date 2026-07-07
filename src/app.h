@@ -13,6 +13,13 @@ struct EventSummary {
     bool is_end_turn = false;   // assistant message.stop_reason == "end_turn"
     bool is_api_error = false;  // system subtype == "api_error"
     LONGLONG ts_ms = 0;         // wall-clock time of parse (GetTickCount64 ms)
+
+    // Token usage from message.usage — only set on assistant events with a
+    // non-zero usage block. Cumulative per call (not per line).
+    unsigned int tokInput            = 0;
+    unsigned int tokOutput           = 0;
+    unsigned int tokCacheRead        = 0;
+    unsigned int tokCacheCreation    = 0;
 };
 
 // Selected power action.

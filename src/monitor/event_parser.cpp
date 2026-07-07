@@ -25,6 +25,21 @@ EventSummary ParseEvent(std::string_view line) {
             if (auto sit = mit->find("stop_reason"); sit != mit->end() && sit->is_string()) {
                 e.is_end_turn = (sit->get<std::string>() == "end_turn");
             }
+            // Token usage — also nested under message.usage. We only pull
+            // the four fields that actually drive billing / cache reuse.
+            if (auto uit = mit->find("usage"); uit != mit->end() && uit->is_object()) {
+                auto num = [&](const char* k) -> unsigned int {
+                    auto it = uit->find(k);
+                    if (it == uit->end() || !it->is_number_unsigned()) return 0;
+                    unsigned long long v = it->get<unsigned long long>();
+                    if (v > 0xFFFFFFFFull) v = 0xFFFFFFFFull;
+                    return (unsigned int)v;
+                };
+                e.tokInput         = num("input_tokens");
+                e.tokOutput        = num("output_tokens");
+                e.tokCacheRead     = num("cache_read_input_tokens");
+                e.tokCacheCreation = num("cache_creation_input_tokens");
+            }
         }
     } else if (*type == "user") {
         e.type = EvtType::User;

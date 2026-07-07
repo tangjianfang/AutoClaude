@@ -44,10 +44,10 @@ constexpr int WIN_H_DEFAULT = 580;
 constexpr int WIN_W_MIN     = 480;
 constexpr int WIN_H_MIN     = 420;
 
-constexpr int ROW_H  = 26;
+constexpr int ROW_H  = 36;
 constexpr int ROW_GAP = 4;
 constexpr int LIST_X = 20;
-constexpr int LIST_Y = 96;
+constexpr int LIST_Y = 86;
 
 struct Region {
     int x, y, w, h;
@@ -71,6 +71,14 @@ struct SessionRow {
     LONGLONG lastEventTsMs = 0;
     LONGLONG lastAssistantMs = 0;
     std::wstring lastEventLabel;
+
+    // Cumulative token usage since the watcher discovered this session.
+    // Per-event values come from message.usage; we add to running totals
+    // so the row can show "this session has used N tokens so far".
+    unsigned long long tokInputTotal         = 0;
+    unsigned long long tokOutputTotal        = 0;
+    unsigned long long tokCacheReadTotal     = 0;
+    unsigned long long tokCacheCreationTotal = 0;
 };
 
 struct Layout {
@@ -81,6 +89,7 @@ struct Layout {
     Region cancelBtn;
     Region startBtn;
     Region closeBtn;
+    Region helpBtn;
     Region grip;
     int  listVisibleRows = 8;
     int  winW = WIN_W_DEFAULT;
@@ -88,15 +97,18 @@ struct Layout {
 
     void Recompute(int w, int h) {
         winW = w; winH = h;
-        title    = {0, 0, w, 46};
-        status   = {20, 56, w - 40, 32};
+        title    = {0, 0, w, 42};
+        status   = {20, 50, w - 40, 28};
+        // Close X lives at the right edge; help "?" sits to its left so the
+        // title strip keeps both buttons discoverable.
+        helpBtn  = {w - 80, 6, 36, 32};
         closeBtn = {w - 44, 6, 36, 32};
 
-        const int pillsH = 54;
-        const int btnH   = 56;
+        const int pillsH = 40;
+        const int btnH   = 46;
         const int footerH = 28;
-        const int gapListToPills = 20;
-        const int gapPillsToBtn  = 14;
+        const int gapListToPills = 16;
+        const int gapPillsToBtn  = 12;
 
         int bottom    = h - footerH;
         int btnsTop   = bottom - btnH;
@@ -142,8 +154,13 @@ struct AppCtx {
     bool hoverGrip  = false;
     bool hoverCancel = false;
     bool hoverStart = false;
+    bool hoverHelp  = false;
     int  hoverPill  = -1;     // 0..3, -1 = none
     bool trackingMouseLeave = false;
+
+    // Help overlay — when true, the main UI paints dimmed and a centred
+    // help card is drawn on top. Any click closes it (ESC also closes).
+    bool helpOpen = false;
 
     // Animation tick count for the breathing active-dot.
     ULONGLONG pulseStartMs = 0;
@@ -198,6 +215,21 @@ std::wstring FormatAgoFine(LONGLONG ms) {
     if (ms < 0) ms = 0;
     if (ms < 1000) return L"now";
     return std::to_wstring((int)(ms / 1000)) + L"s";
+}
+
+// Compact human-readable token count: "942", "1.2k", "1.5M", "2.1G".
+// Used for the per-session "↓in ↑out" footer line.
+std::wstring FormatTokens(unsigned long long n) {
+    if (n < 1000ull)         return std::to_wstring((unsigned long long)n);
+    const wchar_t* units[] = { L"k", L"M", L"G" };
+    double val = (double)n;
+    int u = 0;
+    while (val >= 1000.0 && u < 2) { val /= 1000.0; ++u; }
+    wchar_t buf[32];
+    if (val >= 100.0) swprintf(buf, 32, L"%.0f%ls", val, units[u]);
+    else if (val >= 10.0) swprintf(buf, 32, L"%.1f%ls", val, units[u]);
+    else swprintf(buf, 32, L"%.2f%ls", val, units[u]);
+    return buf;
 }
 
 // Color of the leading indicator for a given SM state.
@@ -300,17 +332,115 @@ void DrawGrip(Gdiplus::Graphics& g, const Region& r,
     }
 }
 
-// One session row. The leading 3px bar is the activity indicator (cyan /
-// amber / emerald / dim); the right dot only appears when the row is the
-// primary. Subagent rows get a tiny "↳" glyph prefix.
+// Help "?" button — same visual weight as close X. Idle: panel bg + dim "?";
+// hover: panelHi bg + bright "?" with an accent border for affordance.
+void DrawHelpIcon(Gdiplus::Graphics& g, const Region& r,
+                  const UIColors& u, bool hover) {
+    Gdiplus::RectF rf = r.RectF();
+    if (hover) {
+        FillRoundGradient(g, rf, u.panelHi,
+                          Gdiplus::Color(255, 30, 36, 46), 8.0f);
+        DrawRound(g, rf, u.accent, 8.0f, 1.0f);
+    } else {
+        FillRoundGradient(g, rf, u.panel, u.bgBottom, 8.0f);
+        DrawRound(g, rf, u.divider, 8.0f, 1.0f);
+    }
+    Gdiplus::Color qc = hover ? u.accentSoft : u.textDim;
+    DrawLabel(g, L"?", rf,
+              L"Segoe UI", 16.0f, Gdiplus::FontStyleBold, qc);
+}
+
+// Centred modal-style help card. Backdrop dims everything beneath at
+// ~70% alpha so the underlying UI is still faintly visible but the card
+// reads as the focus of attention. Click anywhere or press ESC to dismiss.
+void PaintHelpOverlay(Gdiplus::Graphics& g, UIColors& u, int W, int H) {
+    // Dimming backdrop.
+    Gdiplus::SolidBrush back(Gdiplus::Color(180,  8, 10, 16));
+    g.FillRectangle(&back, 0, 0, W, H);
+
+    const int cardW = 480;
+    const int cardH = 360;
+    const int cardX = (W - cardW) / 2;
+    const int cardY = (H - cardH) / 2;
+    Gdiplus::RectF cardRect((float)cardX, (float)cardY,
+                            (float)cardW, (float)cardH);
+    FillRoundGradient(g, cardRect, u.panelAlt, u.bgBottom, 12.0f);
+    DrawRound(g, cardRect, u.grip, 12.0f, 1.0f);
+
+    // Title.
+    DrawLabel(g, L"AutoClaude  —  Quick reference",
+              Gdiplus::RectF((float)(cardX + 24), (float)(cardY + 12),
+                             (float)(cardW - 48), 28.0f),
+              L"Segoe UI", 16.0f, Gdiplus::FontStyleBold, u.text,
+              Gdiplus::StringAlignmentNear, Gdiplus::StringAlignmentCenter);
+    DrawHairline(g, cardX + 24, cardY + 50, cardW - 48, u.divider);
+
+    int bodyX = cardX + 24;
+    int bodyW = cardW - 48;
+    int bodyY = cardY + 62;
+
+    auto Section = [&](const wchar_t* heading,
+                       const std::vector<const wchar_t*>& lines) {
+        // 2px accent bar to the left of the heading.
+        Gdiplus::SolidBrush accB(u.accent);
+        g.FillRectangle(&accB, (float)bodyX, (float)(bodyY + 4),
+                        2.0f, 12.0f);
+        DrawLabelLeft(g, heading,
+                      Gdiplus::RectF((float)(bodyX + 8), (float)bodyY,
+                                     (float)(bodyW - 8), 16.0f),
+                      L"Segoe UI", 12.0f,
+                      Gdiplus::FontStyleBold, u.text);
+        bodyY += 18;
+        for (auto ln : lines) {
+            DrawLabelLeft(g, ln,
+                          Gdiplus::RectF((float)(bodyX + 12), (float)bodyY,
+                                         (float)(bodyW - 12), 14.0f),
+                          L"Segoe UI", 10.5f,
+                          Gdiplus::FontStyleRegular, u.textDim);
+            bodyY += 14;
+        }
+        bodyY += 4;
+    };
+
+    Section(L"Status dot (top row)", {
+        L"cyan  = monitoring ·  amber = idle / countdown",
+        L"red   = done     ·  grey  = paused",
+    });
+    Section(L"Action pills (Shutdown / Restart / Hibernate / Lock)", {
+        L"Pick the action. The cyan-bordered pill is the active one.",
+        L"Fires only on the primary session (newest .jsonl).",
+    });
+    Section(L"Cancel button", {
+        L"Aborts an armed countdown. Red = armed; grey = nothing to cancel.",
+    });
+    Section(L"Pause / Resume", {
+        L"Halts all monitoring. Default mode is DRY-RUN; nothing actually",
+        L"shuts down unless DRY-RUN is off.",
+    });
+    Section(L"Session rows", {
+        L"↳ marks subagent sessions. Bottom line shows last event,",
+        L"event count, and cumulative token usage (↓ in  ↑ out).",
+    });
+
+    // Footer dismiss hint.
+    DrawLabel(g, L"click anywhere to dismiss  ·  ESC",
+              Gdiplus::RectF((float)cardX, (float)(cardY + cardH - 26),
+                             (float)cardW, 18.0f),
+              L"Cascadia Mono", 10.5f,
+              Gdiplus::FontStyleRegular, u.muted);
+}
+
+// One session row, two lines:
+//   top:    ↳ projectName            ago
+//   bottom: last event label · N events · ↓X ↑Y
+// The leading 3px bar is the activity indicator (cyan for primary, hot
+// color for active non-primary, dim otherwise).
 void PaintRow(Gdiplus::Graphics& g, UIColors& u, const SessionRow& r,
               bool isPrimary, int topY, int listW) {
     Gdiplus::RectF rowRect((float)LIST_X, (float)topY,
                            (float)listW, (float)ROW_H);
     int radius = 6;
 
-    // Background: panel for primary, panelAlt for non-primary. Selected
-    // gets a slightly elevated gradient so it reads as the "lead" row.
     if (isPrimary) {
         FillRoundGradient(g, rowRect, u.panelAlt,
                           Gdiplus::Color(255, 27, 31, 40), (float)radius);
@@ -319,48 +449,64 @@ void PaintRow(Gdiplus::Graphics& g, UIColors& u, const SessionRow& r,
         FillRound(g, rowRect, u.panel, (float)radius);
     }
 
-    // Leading 3px activity bar.
+    // Leading 3px activity bar (full row height).
     int hot = RowHotLevel(r);
     Gdiplus::Color barColor = isPrimary ? u.accent : RowHotColor(u, hot);
     Gdiplus::SolidBrush bar(barColor);
-    g.FillRectangle(&bar, (float)LIST_X + 4, (float)topY + 3,
-                    3.0f, (float)ROW_H - 6);
+    g.FillRectangle(&bar, (float)LIST_X + 4, (float)topY + 4,
+                    3.0f, (float)ROW_H - 8);
 
-    // Subagent little arrow + project name (left-aligned at x = LIST_X+12).
-    Gdiplus::RectF textRect(rowRect.X + 12, rowRect.Y,
-                            rowRect.Width - 24, rowRect.Height);
-    std::wstring label;
-    label.reserve(96);
-    label += r.isSubagent ? L"  " L"↳" L"  " : L"";
-    label += r.projectName.empty()
-                  ? (r.isSubagent ? L"<subagent>" : L"<unknown>")
-                  : r.projectName;
-    Gdiplus::Color txt = isPrimary ? u.text : u.textDim;
-    DrawLabelLeft(g, label.c_str(), textRect,
-                 L"Segoe UI", 13.0f,
+    // ---- Top line: project name (left) + ago (right) ----
+    Gdiplus::RectF topRect(rowRect.X + 12, (float)(topY + 1),
+                           rowRect.Width - 80, 17.0f);
+    std::wstring proj;
+    proj.reserve(96);
+    if (r.isSubagent) proj += L"↳  ";
+    proj += r.projectName.empty()
+                ? (r.isSubagent ? L"<subagent>" : L"<unknown>")
+                : r.projectName;
+    DrawLabelLeft(g, proj.c_str(), topRect,
+                 L"Segoe UI", 12.5f,
                  isPrimary ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular,
-                 txt);
+                 isPrimary ? u.text : u.textDim);
 
-    // Right cluster: ago (mono) + small dot.
     std::wstring ago = FormatAgoFine(
         r.lastEventTsMs ? (LONGLONG)GetTickCount64() - r.lastEventTsMs : 0);
-    Gdiplus::RectF agoRect(rowRect.X + rowRect.Width - 76,
-                           rowRect.Y, 56, rowRect.Height);
-    DrawLabel(g, ago.c_str(), agoRect,
-             L"Cascadia Mono", 11.5f,
-             Gdiplus::FontStyleRegular, u.muted);
+    DrawLabel(g, ago.c_str(),
+              Gdiplus::RectF(rowRect.X + rowRect.Width - 72, (float)(topY + 1),
+                             56, 17.0f),
+              L"Cascadia Mono", 11.0f,
+              Gdiplus::FontStyleRegular, u.muted);
 
-    Gdiplus::Color dotC = isPrimary ? u.accent : u.muted;
-    Gdiplus::SolidBrush dotB(dotC);
-    float dDot = 7.0f;
-    float dcx = rowRect.X + rowRect.Width - 12;
-    float dcy = rowRect.Y + rowRect.Height / 2.0f;
-    g.FillEllipse(&dotB, dcx - dDot/2, dcy - dDot/2, dDot, dDot);
+    // ---- Bottom line: last event · N events · ↓in ↑out ----
+    Gdiplus::RectF botRect(rowRect.X + 12, (float)(topY + 18),
+                           rowRect.Width - 24, 16.0f);
+    std::wstring bot;
+    bot.reserve(160);
+    bot += r.lastEventLabel.empty() ? L"waiting…" : r.lastEventLabel;
+    bot += L"  ·  ";
+    bot += std::to_wstring(r.eventsCount);
+    bot += L" events";
+    if (r.tokInputTotal || r.tokOutputTotal) {
+        bot += L"  ·  ↓";
+        bot += FormatTokens(r.tokInputTotal);
+        bot += L"  ↑";
+        bot += FormatTokens(r.tokOutputTotal);
+    }
+    DrawLabelLeft(g, bot.c_str(), botRect,
+                  L"Segoe UI", 10.5f,
+                  Gdiplus::FontStyleRegular, u.muted);
 
-    // Event label on the row underneath the title? We do it inline as a 2nd
-    // text layer below the project name when there's vertical space; for
-    // ROW_H=22 we don't, so the label info shows up only via hover state —
-    // (out of scope, keep rows single-line for now).
+    // Primary row gets a tiny cyan dot on the right of the top line as an
+    // extra affordance (the gradient bg already differentiates it but the
+    // dot makes scanning the list faster).
+    if (isPrimary) {
+        Gdiplus::SolidBrush dotB(u.accent);
+        float dDot = 6.0f;
+        float dcx = rowRect.X + rowRect.Width - 10;
+        float dcy = topY + 9.5f;
+        g.FillEllipse(&dotB, dcx - dDot/2, dcy - dDot/2, dDot, dDot);
+    }
 }
 
 void Paint(HWND hwnd) {
@@ -392,21 +538,22 @@ void Paint(HWND hwnd) {
     DrawHairline(g, 0, titleR.h - 1, W, u.divider);
     DrawLabel(g, L"AUTOCLAUDE",
              Gdiplus::RectF((float)titleR.x + 14, (float)titleR.y,
-                            (float)titleR.w - 60, (float)titleR.h),
+                            (float)titleR.w - 110, (float)titleR.h),
              L"Segoe UI", 16.0f, Gdiplus::FontStyleBold,
              u.text,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
     DrawLabel(g, L"session monitor",
              Gdiplus::RectF((float)titleR.x + 140, (float)titleR.y,
-                            240, (float)titleR.h),
+                            200, (float)titleR.h),
              L"Segoe UI", 11.0f, Gdiplus::FontStyleRegular,
              u.muted,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
 
-    // ---- Close X ----
+    // ---- Close X + Help "?" (help is to the left of close) ----
     DrawCloseX(g, c->layout.closeBtn, u, c->hoverClose);
+    DrawHelpIcon(g, c->layout.helpBtn, u, c->hoverHelp);
 
     // ---- Status row: colored dot + state badge + counters ----
     Region statR = c->layout.status;
@@ -634,6 +781,11 @@ void Paint(HWND hwnd) {
     // ---- Grip ----
     DrawGrip(g, c->layout.grip, u, c->hoverGrip);
 
+    // ---- Help overlay (modal; drawn last so it sits on top of everything) ----
+    if (c->helpOpen) {
+        PaintHelpOverlay(g, u, W, H);
+    }
+
     // Blit.
     Gdiplus::Graphics sg(hdc);
     sg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -663,6 +815,13 @@ void OnSessionEvent(HWND hwnd, SessionEvent* se) {
                                          : L"system event";
         }
         r.lastEventLabel = label;
+
+        // Accumulate token usage. message.usage only appears on assistant
+        // events with response bodies, so this only adds on those.
+        r.tokInputTotal         += se->e.tokInput;
+        r.tokOutputTotal        += se->e.tokOutput;
+        r.tokCacheReadTotal     += se->e.tokCacheRead;
+        r.tokCacheCreationTotal += se->e.tokCacheCreation;
     }
     c->doneMsg.clear();
 
@@ -750,6 +909,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
     bool hGrip   = c->layout.grip.Contains(x, y);
     bool hCancel = c->layout.cancelBtn.Contains(x, y);
     bool hStart  = c->layout.startBtn.Contains(x, y);
+    bool hHelp   = c->layout.helpBtn.Contains(x, y);
     int  hPill   = -1;
     for (int i = 0; i < 4; ++i)
         if (c->layout.pills[i].Contains(x, y)) { hPill = i; break; }
@@ -757,12 +917,14 @@ void OnMouseMove(HWND hwnd, int x, int y) {
                  (hGrip   != c->hoverGrip)   ||
                  (hCancel != c->hoverCancel) ||
                  (hStart  != c->hoverStart)  ||
+                 (hHelp   != c->hoverHelp)   ||
                  (hPill   != c->hoverPill);
     if (dirty) {
         c->hoverClose  = hClose;
         c->hoverGrip   = hGrip;
         c->hoverCancel = hCancel;
         c->hoverStart  = hStart;
+        c->hoverHelp   = hHelp;
         c->hoverPill   = hPill;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -781,9 +943,9 @@ void OnMouseLeave(HWND hwnd) {
     if (!c) return;
     bool dirty = c->hoverClose || c->hoverGrip ||
                  c->hoverCancel || c->hoverStart ||
-                 c->hoverPill >= 0;
+                 c->hoverHelp || c->hoverPill >= 0;
     c->hoverClose = c->hoverGrip = c->hoverCancel =
-        c->hoverStart = false;
+        c->hoverStart = c->hoverHelp = false;
     c->hoverPill = -1;
     c->trackingMouseLeave = false;
     if (dirty) InvalidateRect(hwnd, nullptr, FALSE);
@@ -794,8 +956,22 @@ void OnLButtonDown(HWND hwnd, int x, int y) {
     if (!c) return;
     auto& L = c->layout;
 
+    // Help overlay absorbs any click — it always dismisses regardless of
+    // where the click lands (inside or outside the card). This is the
+    // simplest possible "modal" pattern for a single-window popup app.
+    if (c->helpOpen) {
+        c->helpOpen = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+
     if (L.closeBtn.Contains(x, y)) {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    if (L.helpBtn.Contains(x, y)) {
+        c->helpOpen = true;
+        InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
     for (int i = 0; i < 4; ++i) {
@@ -849,7 +1025,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LPCWSTR id = IDC_ARROW;
                 if (c) {
                     if (c->hoverGrip)                              id = IDC_SIZENWSE;
-                    else if (c->hoverClose || c->hoverPill >= 0 ||
+                    else if (c->hoverClose || c->hoverHelp ||
+                             c->hoverPill >= 0 ||
                              c->hoverCancel || c->hoverStart)       id = IDC_HAND;
                 }
                 SetCursor(LoadCursor(nullptr, id));
@@ -884,6 +1061,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == 1) OnTimerTick(hwnd);
             return 0;
+        case WM_KEYDOWN: {
+            AppCtx* c = Ctx(hwnd);
+            if (!c) return 0;
+            // ESC dismisses the help overlay; F1 toggles it (universal help
+            // key). Both are no-ops when the overlay is closed for F1 only
+            // — ESC is unconditional close.
+            if (wp == VK_ESCAPE && c->helpOpen) {
+                c->helpOpen = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (wp == VK_F1) {
+                c->helpOpen = !c->helpOpen;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            return 0;
+        }
         case WM_APP_EVT:
             OnSessionEvent(hwnd, reinterpret_cast<SessionEvent*>(lp));
             return 0;
@@ -894,19 +1089,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NCHITTEST: {
             // Default for the entire client area is HTCLIENT — this routes
             // mouse clicks through WM_LBUTTONDOWN so OnLButtonDown can route
-            // them to whatever they hit (close, pills, buttons). Returning
-            // HTCLOSE here would route to WM_NCLBUTTONDOWN, where nothing
-            // closes the window (DefWindowProc does NOT auto-close on
-            // HTCLOSE) — that's why the close X was unresponsive.
+            // them to whatever they hit (close, help, pills, buttons).
+            // Returning HTCLOSE here would route to WM_NCLBUTTONDOWN, where
+            // nothing closes the window (DefWindowProc does NOT auto-close
+            // on HTCLOSE) — that's why the close X was unresponsive.
             POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ScreenToClient(hwnd, &p);
             AppCtx* c = Ctx(hwnd);
             if (c) {
-                // Order matters: close button is visually inside the title
-                // strip, so test it first. If we returned HTCAPTION for the
-                // close area, every click on the X would start a window
-                // drag instead of closing.
+                // Order matters: close + help are visually inside the
+                // title strip, so test them before title. If we returned
+                // HTCAPTION for either, clicks would start a window drag
+                // instead of triggering the button.
                 if (c->layout.closeBtn.Contains(p.x, p.y)) return HTCLIENT;
+                if (c->layout.helpBtn.Contains(p.x, p.y))  return HTCLIENT;
                 if (c->layout.grip.Contains(p.x, p.y))    return HTBOTTOMRIGHT;
                 if (c->layout.title.Contains(p.x, p.y))   return HTCAPTION;
             }

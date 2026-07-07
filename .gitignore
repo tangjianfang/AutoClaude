@@ -1,0 +1,11 @@
+# Build output
+build/
+*.obj
+*.exe
+*.pdb
+
+# Runtime artefacts produced next to the exe on first run / when settings change
+# (uncomment the next line if you'd rather not track them:)
+# build/Release/config.json
+build/Release/autoclaude.log
+build/Release/autoclaude-watcher.log

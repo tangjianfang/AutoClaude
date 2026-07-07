@@ -39,15 +39,15 @@ void DLog(const wchar_t* fmt, ...) {
 
 namespace {
 
-constexpr int WIN_W_DEFAULT = 580;
-constexpr int WIN_H_DEFAULT = 520;
-constexpr int WIN_W_MIN     = 420;
-constexpr int WIN_H_MIN     = 360;
+constexpr int WIN_W_DEFAULT = 640;
+constexpr int WIN_H_DEFAULT = 580;
+constexpr int WIN_W_MIN     = 480;
+constexpr int WIN_H_MIN     = 420;
 
-constexpr int ROW_H  = 22;
-constexpr int ROW_GAP = 3;
+constexpr int ROW_H  = 26;
+constexpr int ROW_GAP = 4;
 constexpr int LIST_X = 20;
-constexpr int LIST_Y = 86;
+constexpr int LIST_Y = 96;
 
 struct Region {
     int x, y, w, h;
@@ -88,14 +88,14 @@ struct Layout {
 
     void Recompute(int w, int h) {
         winW = w; winH = h;
-        title    = {0, 0, w, 40};
-        status   = {20, 50, w - 40, 28};
-        closeBtn = {w - 40, 6, 32, 28};
+        title    = {0, 0, w, 46};
+        status   = {20, 56, w - 40, 32};
+        closeBtn = {w - 44, 6, 36, 32};
 
-        const int pillsH = 50;
-        const int btnH   = 52;
-        const int footerH = 26;
-        const int gapListToPills = 18;
+        const int pillsH = 54;
+        const int btnH   = 56;
+        const int footerH = 28;
+        const int gapListToPills = 20;
         const int gapPillsToBtn  = 14;
 
         int bottom    = h - footerH;
@@ -103,7 +103,7 @@ struct Layout {
         int pillsTop  = btnsTop - gapPillsToBtn - pillsH;
         int listBottom = pillsTop - gapListToPills;
         int listTop    = LIST_Y;
-        int listH      = std::max(80, listBottom - listTop);
+        int listH      = std::max(100, listBottom - listTop);
 
         list = {LIST_X, listTop, w - 40, listH};
 
@@ -337,17 +337,17 @@ void PaintRow(Gdiplus::Graphics& g, UIColors& u, const SessionRow& r,
                   : r.projectName;
     Gdiplus::Color txt = isPrimary ? u.text : u.textDim;
     DrawLabelLeft(g, label.c_str(), textRect,
-                 L"Segoe UI", 11.0f,
+                 L"Segoe UI", 13.0f,
                  isPrimary ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular,
                  txt);
 
     // Right cluster: ago (mono) + small dot.
     std::wstring ago = FormatAgoFine(
         r.lastEventTsMs ? (LONGLONG)GetTickCount64() - r.lastEventTsMs : 0);
-    Gdiplus::RectF agoRect(rowRect.X + rowRect.Width - 70,
-                           rowRect.Y, 50, rowRect.Height);
+    Gdiplus::RectF agoRect(rowRect.X + rowRect.Width - 76,
+                           rowRect.Y, 56, rowRect.Height);
     DrawLabel(g, ago.c_str(), agoRect,
-             L"Cascadia Mono", 10.0f,
+             L"Cascadia Mono", 11.5f,
              Gdiplus::FontStyleRegular, u.muted);
 
     Gdiplus::Color dotC = isPrimary ? u.accent : u.muted;
@@ -393,14 +393,14 @@ void Paint(HWND hwnd) {
     DrawLabel(g, L"AUTOCLAUDE",
              Gdiplus::RectF((float)titleR.x + 14, (float)titleR.y,
                             (float)titleR.w - 60, (float)titleR.h),
-             L"Segoe UI", 14.0f, Gdiplus::FontStyleBold,
+             L"Segoe UI", 16.0f, Gdiplus::FontStyleBold,
              u.text,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
     DrawLabel(g, L"session monitor",
-             Gdiplus::RectF((float)titleR.x + 130, (float)titleR.y,
-                            220, (float)titleR.h),
-             L"Segoe UI", 10.0f, Gdiplus::FontStyleRegular,
+             Gdiplus::RectF((float)titleR.x + 140, (float)titleR.y,
+                            240, (float)titleR.h),
+             L"Segoe UI", 11.0f, Gdiplus::FontStyleRegular,
              u.muted,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
@@ -429,7 +429,7 @@ void Paint(HWND hwnd) {
 
     // Leading state dot.
     Gdiplus::SolidBrush dotB(dotColor);
-    float dotD = 9.0f;
+    float dotD = 11.0f;
     g.FillEllipse(&dotB, (float)statR.x, (float)statR.y + (statR.h - dotD) / 2,
                   dotD, dotD);
 
@@ -446,15 +446,15 @@ void Paint(HWND hwnd) {
         if (c->paused) right += L" · PAUSED";
     }
     DrawLabel(g, left.c_str(),
-             Gdiplus::RectF((float)statR.x + 18, (float)statR.y,
-                            230, (float)statR.h),
-             L"Segoe UI", 11.5f, Gdiplus::FontStyleBold, u.text,
+             Gdiplus::RectF((float)statR.x + 22, (float)statR.y,
+                            250, (float)statR.h),
+             L"Segoe UI", 13.0f, Gdiplus::FontStyleBold, u.text,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
     DrawLabel(g, right.c_str(),
-             Gdiplus::RectF((float)statR.x + 240, (float)statR.y,
-                            (float)statR.w - 260, (float)statR.h),
-             L"Segoe UI", 11.0f, Gdiplus::FontStyleRegular, u.muted,
+             Gdiplus::RectF((float)statR.x + 260, (float)statR.y,
+                            (float)statR.w - 280, (float)statR.h),
+             L"Segoe UI", 12.0f, Gdiplus::FontStyleRegular, u.muted,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
 
@@ -501,8 +501,8 @@ void Paint(HWND hwnd) {
                                 (float)c->layout.list.y,
                                 (float)c->layout.list.w,
                                 (float)c->layout.list.h),
-                 L"Segoe UI", 11.0f,
-                 Gdiplus::FontStyleItalic, u.dim);
+                 L"Segoe UI", 13.0f,
+                 Gdiplus::FontStyleItalic, u.muted);
     } else if ((int)c->sessions.size() > visible) {
         int endIdx = std::min<int>(c->scrollOffset + visible,
                                     (int)c->sessions.size());
@@ -513,8 +513,8 @@ void Paint(HWND hwnd) {
                  Gdiplus::RectF((float)(c->layout.list.x),
                                 (float)(LIST_Y + c->layout.list.h + 4),
                                 (float)listW, 14),
-                 L"Cascadia Mono", 9.0f,
-                 Gdiplus::FontStyleRegular, u.dim);
+                 L"Cascadia Mono", 10.0f,
+                 Gdiplus::FontStyleRegular, u.muted);
     }
 
     // ---- Action pills ----
@@ -540,7 +540,7 @@ void Paint(HWND hwnd) {
                                    : u.textDim;
         int style = sel ? Gdiplus::FontStyleBold : Gdiplus::FontStyleBold;
         DrawLabel(g, names[i], rf,
-                 L"Segoe UI", 12.0f, style, tColor);
+                 L"Segoe UI", 13.0f, style, tColor);
     }
 
     // ---- Cancel + Start/Pause buttons ----
@@ -569,10 +569,10 @@ void Paint(HWND hwnd) {
         Gdiplus::RectF subRect(rf.X, rf.Y + rf.Height / 2 + 2,
                                rf.Width, rf.Height / 2 - 4);
         DrawLabel(g, L"Cancel", topRect,
-                  L"Segoe UI", 11.5f, Gdiplus::FontStyleBold, cT);
+                  L"Segoe UI", 13.0f, Gdiplus::FontStyleBold, cT);
         DrawLabel(g, armed ? L"scheduled action" : L"abort countdown",
                   subRect,
-                  L"Segoe UI", 8.5f, Gdiplus::FontStyleRegular, cC);
+                  L"Segoe UI", 10.0f, Gdiplus::FontStyleRegular, cC);
     }
     // Pause / Resume
     {
@@ -584,12 +584,12 @@ void Paint(HWND hwnd) {
                               Gdiplus::Color(255,  8, 50, 82), 10.0f);
             DrawRound(g, rf, u.accent, 10.0f, 1.5f);
             DrawLabel(g, L"Resume", rf,
-                     L"Segoe UI", 11.5f,
+                     L"Segoe UI", 13.0f,
                      Gdiplus::FontStyleBold, u.text);
             DrawLabel(g, L"halt monitoring", rf,
-                     L"Segoe UI", 8.5f,
+                     L"Segoe UI", 10.0f,
                      Gdiplus::FontStyleRegular,
-                     Gdiplus::Color(255, 200, 230, 250));
+                     Gdiplus::Color(255, 220, 240, 255));
         } else {
             Gdiplus::Color fillT = hot ? u.panelHi : u.panel;
             FillRoundGradient(g, rf, fillT, u.bgBottom, 10.0f);
@@ -597,12 +597,12 @@ void Paint(HWND hwnd) {
             DrawLabel(g, L"Pause",
                      Gdiplus::RectF(rf.X, rf.Y + 4, rf.Width,
                                     rf.Height / 2 - 2),
-                     L"Segoe UI", 11.5f,
+                     L"Segoe UI", 13.0f,
                      Gdiplus::FontStyleBold, u.text);
             DrawLabel(g, L"halt monitoring",
                      Gdiplus::RectF(rf.X, rf.Y + rf.Height / 2 + 2,
                                     rf.Width, rf.Height / 2 - 4),
-                     L"Segoe UI", 8.5f,
+                     L"Segoe UI", 10.0f,
                      Gdiplus::FontStyleRegular, u.dim);
         }
     }
@@ -628,7 +628,7 @@ void Paint(HWND hwnd) {
     DrawHairline(g, 0, footerY - 2, W, u.divider);
     DrawLabelLeft(g, foot.c_str(),
                  Gdiplus::RectF(20, (float)footerY, (float)(W - 40), 18),
-                 L"Cascadia Mono", 9.0f,
+                 L"Cascadia Mono", 10.5f,
                  Gdiplus::FontStyleRegular, u.muted);
 
     // ---- Grip ----
@@ -902,8 +902,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ScreenToClient(hwnd, &p);
             AppCtx* c = Ctx(hwnd);
             if (c) {
-                if (c->layout.grip.Contains(p.x, p.y))  return HTBOTTOMRIGHT;
-                if (c->layout.title.Contains(p.x, p.y)) return HTCAPTION;
+                // Order matters: close button is visually inside the title
+                // strip, so test it first. If we returned HTCAPTION for the
+                // close area, every click on the X would start a window
+                // drag instead of closing.
+                if (c->layout.closeBtn.Contains(p.x, p.y)) return HTCLIENT;
+                if (c->layout.grip.Contains(p.x, p.y))    return HTBOTTOMRIGHT;
+                if (c->layout.title.Contains(p.x, p.y))   return HTCAPTION;
             }
             return HTCLIENT;
         }

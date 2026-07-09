@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <string>
 #include <fstream>
+#include <json.hpp>
 
 // Paths under %USERPROFILE%\.claude\autoclaude (overridable via AUTOCLAUDE_DIR),
 // shared with the Node hook. Header-only so both window.cpp and any future
@@ -42,4 +43,32 @@ inline bool WriteStopFlag() {
     std::wstring p = StopFlagPath();
     std::ofstream f(p.c_str(), std::ios::binary | std::ios::trunc);
     return (bool)f;
+}
+
+inline std::wstring LoopConfigPath() { return AcDir() + L"\\loop-config.json"; }
+
+// Read the loop-config.json "enabled" flag. Missing/malformed -> false.
+inline bool ReadLoopEnabled() {
+    try {
+        std::ifstream f(LoopConfigPath(), std::ios::binary);
+        if (!f) return false;
+        nlohmann::json j; f >> j;
+        return j.value("enabled", false);
+    } catch (...) { return false; }
+}
+
+// Flip "enabled" in loop-config.json, preserving other fields. Returns new value.
+inline bool ToggleLoopEnabled() {
+    nlohmann::json j;
+    try {
+        std::ifstream f(LoopConfigPath(), std::ios::binary);
+        if (f) f >> j;
+    } catch (...) { j = nlohmann::json::object(); }
+    if (!j.is_object()) j = nlohmann::json::object();
+    bool nv = !j.value("enabled", false);
+    j["enabled"] = nv;
+    EnsureDir(AcDir());
+    std::ofstream o(LoopConfigPath(), std::ios::binary | std::ios::trunc);
+    o << j.dump(2);
+    return nv;
 }

@@ -97,6 +97,7 @@ struct Layout {
     Region startBtn;
     Region closeBtn;
     Region helpBtn;
+    Region loopToggle;
     Region grip;
     int  listVisibleRows = 8;
     int  winW = WIN_W_DEFAULT;
@@ -110,6 +111,8 @@ struct Layout {
         // title strip keeps both buttons discoverable.
         helpBtn  = {w - 80, 6, 36, 32};
         closeBtn = {w - 44, 6, 36, 32};
+        // LOOP on/off pill at the right end of the status row.
+        loopToggle = {w - 20 - 92, 52, 92, 24};
 
         const int pillsH = 40;
         const int btnH   = 46;
@@ -166,8 +169,13 @@ struct AppCtx {
     bool hoverStopLoop = false;
     bool hoverStart = false;
     bool hoverHelp  = false;
+    bool hoverLoopToggle = false;
     int  hoverPill  = -1;     // 0..3, -1 = none
     bool trackingMouseLeave = false;
+
+    // Cached loop-config.json "enabled" for the LOOP toggle pill; refreshed
+    // on startup and after each toggle click.
+    bool loopEnabledCached = false;
 
     // Help overlay — when true, the main UI paints dimmed and a centred
     // help card is drawn on top. Any click closes it (ESC also closes).
@@ -370,7 +378,7 @@ void PaintHelpOverlay(Gdiplus::Graphics& g, UIColors& u, int W, int H) {
     g.FillRectangle(&back, 0, 0, W, H);
 
     const int cardW = 480;
-    const int cardH = 360;
+    const int cardH = 420;
     const int cardX = (W - cardW) / 2;
     const int cardY = (H - cardH) / 2;
     Gdiplus::RectF cardRect((float)cardX, (float)cardY,
@@ -431,6 +439,11 @@ void PaintHelpOverlay(Gdiplus::Graphics& g, UIColors& u, int W, int H) {
     Section(L"Session rows", {
         L"↳ marks subagent sessions. Bottom line shows last event,",
         L"event count, and cumulative token usage (↓ in  ↑ out).",
+    });
+    Section(L"Auto-continue loop", {
+        L"LOOP toggle (top-right) turns auto-continue on/off. When on, a",
+        L"Stop hook re-prompts Claude each turn until [[ALL_DONE]] or the",
+        L"max-turns cap. Stop Loop button halts it next turn.",
     });
 
     // Footer dismiss hint.
@@ -621,6 +634,26 @@ void Paint(HWND hwnd) {
              L"Segoe UI", 12.0f, Gdiplus::FontStyleRegular, u.muted,
              Gdiplus::StringAlignmentNear,
              Gdiplus::StringAlignmentCenter);
+
+    // LOOP on/off toggle pill (right end of status row).
+    {
+        Region r = c->layout.loopToggle;
+        bool on = c->loopEnabledCached;
+        bool hot = c->hoverLoopToggle;
+        Gdiplus::RectF rf = r.RectF();
+        if (on) {
+            FillRoundGradient(g, rf, u.accentDeep,
+                              Gdiplus::Color(255, 8, 50, 82), 9.0f);
+            DrawRound(g, rf, u.accent, 9.0f, 1.5f);
+        } else {
+            Gdiplus::Color fillT = hot ? u.panelHi : u.panel;
+            FillRoundGradient(g, rf, fillT, u.bgBottom, 9.0f);
+            DrawRound(g, rf, hot ? u.gripHot : u.divider, 9.0f, 1.0f);
+        }
+        DrawLabel(g, on ? L"LOOP: ON" : L"LOOP: OFF", rf,
+                  L"Segoe UI", 11.0f, Gdiplus::FontStyleBold,
+                  on ? u.text : u.textDim);
+    }
 
     // Countdown bar (only when state == Countdown).
     if (c->sm.state == State::Countdown && !c->paused) {
@@ -966,6 +999,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
     bool hStopLoop = c->layout.stopLoopBtn.Contains(x, y);
     bool hStart  = c->layout.startBtn.Contains(x, y);
     bool hHelp   = c->layout.helpBtn.Contains(x, y);
+    bool hLoopT  = c->layout.loopToggle.Contains(x, y);
     int  hPill   = -1;
     for (int i = 0; i < 4; ++i)
         if (c->layout.pills[i].Contains(x, y)) { hPill = i; break; }
@@ -975,6 +1009,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
                  (hStopLoop != c->hoverStopLoop) ||
                  (hStart  != c->hoverStart)  ||
                  (hHelp   != c->hoverHelp)   ||
+                 (hLoopT  != c->hoverLoopToggle) ||
                  (hPill   != c->hoverPill);
     if (dirty) {
         c->hoverClose  = hClose;
@@ -983,6 +1018,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
         c->hoverStopLoop = hStopLoop;
         c->hoverStart  = hStart;
         c->hoverHelp   = hHelp;
+        c->hoverLoopToggle = hLoopT;
         c->hoverPill   = hPill;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -1001,9 +1037,9 @@ void OnMouseLeave(HWND hwnd) {
     if (!c) return;
     bool dirty = c->hoverClose || c->hoverGrip ||
                  c->hoverCancel || c->hoverStopLoop || c->hoverStart ||
-                 c->hoverHelp || c->hoverPill >= 0;
+                 c->hoverHelp || c->hoverLoopToggle || c->hoverPill >= 0;
     c->hoverClose = c->hoverGrip = c->hoverCancel = c->hoverStopLoop =
-        c->hoverStart = c->hoverHelp = false;
+        c->hoverStart = c->hoverHelp = c->hoverLoopToggle = false;
     c->hoverPill = -1;
     c->trackingMouseLeave = false;
     if (dirty) InvalidateRect(hwnd, nullptr, FALSE);
@@ -1029,6 +1065,14 @@ void OnLButtonDown(HWND hwnd, int x, int y) {
     }
     if (L.helpBtn.Contains(x, y)) {
         c->helpOpen = true;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    if (L.loopToggle.Contains(x, y)) {
+        c->loopEnabledCached = ToggleLoopEnabled();
+        c->doneMsg = c->loopEnabledCached
+                         ? L"auto-continue loop ENABLED"
+                         : L"auto-continue loop DISABLED";
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
@@ -1090,7 +1134,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (c) {
                     if (c->hoverGrip)                              id = IDC_SIZENWSE;
                     else if (c->hoverClose || c->hoverHelp ||
-                             c->hoverPill >= 0 ||
+                             c->hoverPill >= 0 || c->hoverLoopToggle ||
                              c->hoverCancel || c->hoverStopLoop ||
                              c->hoverStart)                          id = IDC_HAND;
                 }
@@ -1215,6 +1259,7 @@ void RunApp(const Config& initialCfg) {
     auto ctx = std::make_unique<AppCtx>();
     ctx->cfg = initialCfg;
     ctx->exeDir = ExeDir();
+    ctx->loopEnabledCached = ReadLoopEnabled();
 
     const wchar_t* kClass = L"AutoClaudeClass";
     WNDCLASSEXW wc{};

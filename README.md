@@ -41,6 +41,23 @@ build/Release/AutoClaude.exe --live
 action — the status line just reports what would have run. Pass `--live` to actually
 shutdown / restart / hibernate / lock.
 
+## Auto-continue loop
+
+Beyond monitoring + power actions, AutoClaude can **auto-continue** a Claude Code session:
+after each turn ends, a Claude Code **Stop hook** injects a "继续下一步" prompt so Claude
+keeps working until a stop condition is met (a `[[ALL_DONE]]` marker, a max-turns cap, or a
+user "Stop Loop"). The hook works standalone — AutoClaude's GUI is optional and only adds
+live observation (a `loop N/M` badge) plus a Stop-Loop button.
+
+See [`hooks/README.md`](hooks/README.md) for install and configuration, and
+[`docs/superpowers/specs/2026-07-09-auto-continue-loop-design.md`](docs/superpowers/specs/2026-07-09-auto-continue-loop-design.md)
+for the design.
+
+```bash
+node hooks/install-hook.js          # register the Stop hook (idempotent)
+# then edit %USERPROFILE%\.claude\autoclaude\loop-config.json → "enabled": true
+```
+
 ## How it works
 
 1. A worker thread tails the session JSONL: it opens the file with `FILE_SHARE_WRITE`

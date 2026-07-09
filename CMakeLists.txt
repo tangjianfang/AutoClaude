@@ -16,6 +16,7 @@ add_executable(AutoClaude WIN32
   src/monitor/event_parser.cpp
   src/core/state_machine.cpp
   src/power/power_action.cpp
+  src/ipc/status_pipe.cpp
 )
 
 target_include_directories(AutoClaude PRIVATE src)

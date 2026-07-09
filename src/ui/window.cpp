@@ -1,6 +1,7 @@
 #include "window.h"
 #include "drawing.h"
 #include "../power/power_action.h"
+#include "../ipc/status_pipe.h"
 #include <windows.h>
 #include <windowsx.h>
 #include <objidl.h>
@@ -79,6 +80,10 @@ struct SessionRow {
     unsigned long long tokOutputTotal        = 0;
     unsigned long long tokCacheReadTotal     = 0;
     unsigned long long tokCacheCreationTotal = 0;
+
+    // Auto-continue loop status (from the named-pipe sensor).
+    int  autoTurns = 0;
+    bool loopEnabled = false;
 };
 
 struct Layout {
@@ -140,6 +145,7 @@ struct AppCtx {
     Config cfg;
     std::wstring exeDir;
     TranscriptWatcher watcher;
+    StatusPipeServer pipe;
     StateMachine sm;
     bool paused = false;
     Layout layout;
@@ -436,7 +442,7 @@ void PaintHelpOverlay(Gdiplus::Graphics& g, UIColors& u, int W, int H) {
 // The leading 3px bar is the activity indicator (cyan for primary, hot
 // color for active non-primary, dim otherwise).
 void PaintRow(Gdiplus::Graphics& g, UIColors& u, const SessionRow& r,
-              bool isPrimary, int topY, int listW) {
+              bool isPrimary, int topY, int listW, int maxAutoTurns) {
     Gdiplus::RectF rowRect((float)LIST_X, (float)topY,
                            (float)listW, (float)ROW_H);
     int radius = 6;
@@ -492,6 +498,12 @@ void PaintRow(Gdiplus::Graphics& g, UIColors& u, const SessionRow& r,
         bot += FormatTokens(r.tokInputTotal);
         bot += L"  ↑";
         bot += FormatTokens(r.tokOutputTotal);
+    }
+    if (r.loopEnabled) {
+        bot += L"  ·  loop ";
+        bot += std::to_wstring(r.autoTurns);
+        bot += L"/";
+        bot += std::to_wstring(maxAutoTurns);
     }
     DrawLabelLeft(g, bot.c_str(), botRect,
                   L"Segoe UI", 10.5f,
@@ -637,7 +649,7 @@ void Paint(HWND hwnd) {
         const SessionRow& r = c->sessions[c->scrollOffset + i];
         bool isPrimary = (r.path == c->primaryPath);
         int topY = LIST_Y + i * (ROW_H + ROW_GAP);
-        PaintRow(g, u, r, isPrimary, topY, listW);
+        PaintRow(g, u, r, isPrimary, topY, listW, c->cfg.maxAutoTurns);
     }
     if (c->sessions.empty()) {
         std::wstring empty = L"no .jsonl files modified in the last "
@@ -873,6 +885,24 @@ void OnSessionsUpdate(HWND hwnd, const std::vector<TrackInfo>* snap) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
+void OnLoopStatus(HWND hwnd, LoopStatus* ls) {
+    AppCtx* c = Ctx(hwnd);
+    if (!c) { delete ls; return; }
+    // Match the frame's sessionId against a row by path substring (the row's
+    // path stem starts with the sessionId's first chars).
+    if (!ls->sessionId.empty()) {
+        for (auto& r : c->sessions) {
+            if (r.path.find(ls->sessionId) != std::wstring::npos) {
+                r.autoTurns = ls->autoTurns;
+                r.loopEnabled = ls->loopEnabled;
+                break;
+            }
+        }
+    }
+    delete ls;
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 void OnTimerTick(HWND hwnd) {
     AppCtx* c = Ctx(hwnd);
     if (!c) return;
@@ -1086,6 +1116,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             OnSessionsUpdate(hwnd,
                 reinterpret_cast<const std::vector<TrackInfo>*>(lp));
             return 0;
+        case WM_APP_LOOPSTATUS:
+            OnLoopStatus(hwnd, reinterpret_cast<LoopStatus*>(lp));
+            return 0;
         case WM_NCHITTEST: {
             // Default for the entire client area is HTCLIENT — this routes
             // mouse clicks through WM_LBUTTONDOWN so OnLButtonDown can route
@@ -1170,6 +1203,7 @@ void RunApp(const Config& initialCfg) {
     if (!hwnd) return;
 
     ctx->watcher.Start(hwnd, ctx->cfg);
+    ctx->pipe.Start(hwnd);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -1178,6 +1212,7 @@ void RunApp(const Config& initialCfg) {
     }
 
     ctx->watcher.Stop();
+    ctx->pipe.Stop();
     ctx.release();
     GdiShutdown();
 }

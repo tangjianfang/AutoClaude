@@ -75,6 +75,7 @@ void Config::Load(const std::wstring& exeDir) {
         }
         if (auto it = j.find("dryRun");            it != j.end() && it->is_boolean()) dryRun = it->get<bool>();
         if (auto it = j.find("autoSwitchSession"); it != j.end() && it->is_boolean()) autoSwitchSession = it->get<bool>();
+        if (auto it = j.find("maxAutoTurns"); it != j.end() && it->is_number_integer()) maxAutoTurns = it->get<int>();
     } catch (const nlohmann::json::exception&) {
         // Malformed config — keep defaults.
     }
@@ -93,6 +94,7 @@ void Config::Save(const std::wstring& exeDir) const {
         {"action",            ActionName(action)},
         {"dryRun",            dryRun},
         {"autoSwitchSession", autoSwitchSession},
+        {"maxAutoTurns",      maxAutoTurns},
     };
     f << j.dump(2);
 }

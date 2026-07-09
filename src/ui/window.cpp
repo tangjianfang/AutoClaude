@@ -2,6 +2,7 @@
 #include "drawing.h"
 #include "../power/power_action.h"
 #include "../ipc/status_pipe.h"
+#include "../ipc/ac_paths.h"
 #include <windows.h>
 #include <windowsx.h>
 #include <objidl.h>
@@ -92,6 +93,7 @@ struct Layout {
     Region list;
     Region pills[4];
     Region cancelBtn;
+    Region stopLoopBtn;
     Region startBtn;
     Region closeBtn;
     Region helpBtn;
@@ -129,10 +131,12 @@ struct Layout {
         for (int i = 0; i < 4; ++i)
             pills[i] = {20 + i * (pw + 10), pillsTop, pw, pillsH};
 
-        int halfGap = 8;
-        int halfW   = ((w - 40) - halfGap) / 2;
-        cancelBtn = {20,               btnsTop, halfW, btnH};
-        startBtn  = {20 + halfW + halfGap, btnsTop, halfW, btnH};
+        // Bottom row: three equal buttons — Cancel / Stop Loop / Pause.
+        int triGap = 8;
+        int triW   = ((w - 40) - 2 * triGap) / 3;
+        cancelBtn   = {20,                          btnsTop, triW, btnH};
+        stopLoopBtn = {20 + triW + triGap,          btnsTop, triW, btnH};
+        startBtn    = {20 + 2 * (triW + triGap),    btnsTop, triW, btnH};
 
         grip = {w - 24, h - 24, 24, 24};
         listVisibleRows = std::max(1, listH / (ROW_H + ROW_GAP));
@@ -159,6 +163,7 @@ struct AppCtx {
     bool hoverClose = false;
     bool hoverGrip  = false;
     bool hoverCancel = false;
+    bool hoverStopLoop = false;
     bool hoverStart = false;
     bool hoverHelp  = false;
     int  hoverPill  = -1;     // 0..3, -1 = none
@@ -733,6 +738,26 @@ void Paint(HWND hwnd) {
                   subRect,
                   L"Segoe UI", 10.0f, Gdiplus::FontStyleRegular, cC);
     }
+    // Stop Loop: writes stop-flag so the Stop hook halts auto-continue next turn.
+    {
+        Region r = c->layout.stopLoopBtn;
+        bool hot = c->hoverStopLoop;
+        bool active = false;
+        for (const auto& s : c->sessions) if (s.loopEnabled) { active = true; break; }
+        Gdiplus::RectF rf = r.RectF();
+        Gdiplus::Color fillT = hot ? u.panelHi : u.panel;
+        FillRoundGradient(g, rf, fillT, u.bgBottom, 10.0f);
+        DrawRound(g, rf, active ? u.warn : (hot ? u.gripHot : u.divider),
+                  10.0f, active ? 1.5f : 1.0f);
+        Gdiplus::Color tColor = active ? u.text : u.textDim;
+        Gdiplus::RectF topRect(rf.X, rf.Y + 4, rf.Width, rf.Height / 2 - 2);
+        Gdiplus::RectF subRect(rf.X, rf.Y + rf.Height / 2 + 2,
+                               rf.Width, rf.Height / 2 - 4);
+        DrawLabel(g, L"Stop Loop", topRect,
+                  L"Segoe UI", 13.0f, Gdiplus::FontStyleBold, tColor);
+        DrawLabel(g, L"halt auto-continue", subRect,
+                  L"Segoe UI", 10.0f, Gdiplus::FontStyleRegular, u.dim);
+    }
     // Pause / Resume
     {
         Region r = c->layout.startBtn;
@@ -938,6 +963,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
     bool hClose  = c->layout.closeBtn.Contains(x, y);
     bool hGrip   = c->layout.grip.Contains(x, y);
     bool hCancel = c->layout.cancelBtn.Contains(x, y);
+    bool hStopLoop = c->layout.stopLoopBtn.Contains(x, y);
     bool hStart  = c->layout.startBtn.Contains(x, y);
     bool hHelp   = c->layout.helpBtn.Contains(x, y);
     int  hPill   = -1;
@@ -946,6 +972,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
     bool dirty = (hClose  != c->hoverClose)  ||
                  (hGrip   != c->hoverGrip)   ||
                  (hCancel != c->hoverCancel) ||
+                 (hStopLoop != c->hoverStopLoop) ||
                  (hStart  != c->hoverStart)  ||
                  (hHelp   != c->hoverHelp)   ||
                  (hPill   != c->hoverPill);
@@ -953,6 +980,7 @@ void OnMouseMove(HWND hwnd, int x, int y) {
         c->hoverClose  = hClose;
         c->hoverGrip   = hGrip;
         c->hoverCancel = hCancel;
+        c->hoverStopLoop = hStopLoop;
         c->hoverStart  = hStart;
         c->hoverHelp   = hHelp;
         c->hoverPill   = hPill;
@@ -972,9 +1000,9 @@ void OnMouseLeave(HWND hwnd) {
     AppCtx* c = Ctx(hwnd);
     if (!c) return;
     bool dirty = c->hoverClose || c->hoverGrip ||
-                 c->hoverCancel || c->hoverStart ||
+                 c->hoverCancel || c->hoverStopLoop || c->hoverStart ||
                  c->hoverHelp || c->hoverPill >= 0;
-    c->hoverClose = c->hoverGrip = c->hoverCancel =
+    c->hoverClose = c->hoverGrip = c->hoverCancel = c->hoverStopLoop =
         c->hoverStart = c->hoverHelp = false;
     c->hoverPill = -1;
     c->trackingMouseLeave = false;
@@ -1019,6 +1047,12 @@ void OnLButtonDown(HWND hwnd, int x, int y) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
+    if (L.stopLoopBtn.Contains(x, y)) {
+        WriteStopFlag();
+        c->doneMsg = L"stop-flag written · loop halts next turn";
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
     if (L.startBtn.Contains(x, y)) {
         c->paused = !c->paused;
         c->watcher.SetPaused(c->paused);
@@ -1057,7 +1091,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (c->hoverGrip)                              id = IDC_SIZENWSE;
                     else if (c->hoverClose || c->hoverHelp ||
                              c->hoverPill >= 0 ||
-                             c->hoverCancel || c->hoverStart)       id = IDC_HAND;
+                             c->hoverCancel || c->hoverStopLoop ||
+                             c->hoverStart)                          id = IDC_HAND;
                 }
                 SetCursor(LoadCursor(nullptr, id));
                 return TRUE;

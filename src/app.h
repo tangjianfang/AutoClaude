@@ -33,6 +33,16 @@ enum class State { Monitoring, IdleWaiting, Countdown, Done };
 #define WM_APP_EVT     (WM_APP + 1)   // LPARAM = SessionEvent* (path + EventSummary)
 #define WM_APP_SESSION (WM_APP + 2)   // LPARAM = nullptr (legacy single-session switch)
 #define WM_APP_SESSIONS (WM_APP + 3)  // LPARAM = std::vector<TrackInfo>* snapshot of active tracks
+#define WM_APP_LOOPSTATUS (WM_APP + 4)  // LPARAM = LoopStatus* (UI thread deletes)
+
+// Auto-continue loop status for one session, pushed by the named-pipe sensor
+// (statusline.js broadcast). The UI matches it to a session row by sessionId.
+struct LoopStatus {
+    std::wstring sessionId;
+    std::wstring cwd;
+    bool loopEnabled = false;
+    int  autoTurns = 0;
+};
 
 // Watcher → UI event bundle. The path lets the UI route to the correct row
 // even if the list reorders between the post and the UI receive.
